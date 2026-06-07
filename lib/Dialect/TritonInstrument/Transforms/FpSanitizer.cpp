@@ -1657,7 +1657,6 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
       tt::AddPtrOp::create(rewriter, loc, dPtr.getType(), dPtr, dOffset);
 
   Value sum;
-  bool hasSharedOperand = aSource.isShared() || bSource.isShared();
   int numWarps = ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
   auto isScaleK32Aligned = [](Value scalePtr, int64_t scaleFactor) {
     return !scalePtr || (scaleFactor > 0 && ((kI8MmaK % scaleFactor) == 0 ||
@@ -1692,45 +1691,35 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
   Value accInit = arith::MulIOp::create(rewriter, loc, accTileI, useDMask);
 
   if (canUseI8Decomposition) {
-    if (!hasSharedOperand && !scale.computeElem && accElem.getWidth() <= 32) {
-      Value aTile = loadMmaOperand(rewriter, loc, aSource, aSource.tileType,
-                                   /*isLhs=*/true, mIdxI32, zero);
-      Value bTile = loadMmaOperand(rewriter, loc, bSource, bSource.tileType,
-                                   /*isLhs=*/false, nIdxI32, zero);
-      sum = emitI8DotDecomposition(
-          rewriter, loc, embedToInt(rewriter, loc, aTile),
-          embedToInt(rewriter, loc, bTile), accElem, accInit);
+    Value kUpper =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(k));
+    Value kStep = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(kI8MmaK));
+    auto kLoop =
+        scf::ForOp::create(rewriter, loc, zero, kUpper, kStep, accInit);
+    rewriter.setInsertionPointToStart(kLoop.getBody());
+    Value kIdx = kLoop.getInductionVar();
+    Value kI32 = arith::IndexCastOp::create(rewriter, loc, i32Ty, kIdx);
+    Value aChunk;
+    Value bChunk;
+    if (scale.computeElem) {
+      aChunk = loadScaledOperandK32(rewriter, loc, /*isLhs=*/true, aSource,
+                                    scale, mIdxI32, kI32, mmaLayout);
+      bChunk = loadScaledOperandK32(rewriter, loc, /*isLhs=*/false, bSource,
+                                    scale, nIdxI32, kI32, mmaLayout);
     } else {
-      Value kUpper = arith::ConstantOp::create(rewriter, loc,
-                                               rewriter.getI32IntegerAttr(k));
-      Value kStep = arith::ConstantOp::create(
-          rewriter, loc, rewriter.getI32IntegerAttr(kI8MmaK));
-      auto kLoop =
-          scf::ForOp::create(rewriter, loc, zero, kUpper, kStep, accInit);
-      rewriter.setInsertionPointToStart(kLoop.getBody());
-      Value kIdx = kLoop.getInductionVar();
-      Value kI32 = arith::IndexCastOp::create(rewriter, loc, i32Ty, kIdx);
-      Value aChunk;
-      Value bChunk;
-      if (scale.computeElem) {
-        aChunk = loadScaledOperandK32(rewriter, loc, /*isLhs=*/true, aSource,
-                                      scale, mIdxI32, kI32, mmaLayout);
-        bChunk = loadScaledOperandK32(rewriter, loc, /*isLhs=*/false, bSource,
-                                      scale, nIdxI32, kI32, mmaLayout);
-      } else {
-        aChunk = loadOperandK32(rewriter, loc, /*isLhs=*/true, aSource, mIdxI32,
-                                kI32, mmaLayout);
-        bChunk = loadOperandK32(rewriter, loc, /*isLhs=*/false, bSource,
-                                nIdxI32, kI32, mmaLayout);
-      }
-      Value next = emitI8DotDecomposition(
-          rewriter, loc, embedToInt(rewriter, loc, aChunk),
-          embedToInt(rewriter, loc, bChunk), accElem,
-          kLoop.getRegionIterArgs()[0]);
-      scf::YieldOp::create(rewriter, loc, next);
-      rewriter.setInsertionPointAfter(kLoop);
-      sum = kLoop.getResult(0);
+      aChunk = loadOperandK32(rewriter, loc, /*isLhs=*/true, aSource, mIdxI32,
+                              kI32, mmaLayout);
+      bChunk = loadOperandK32(rewriter, loc, /*isLhs=*/false, bSource, nIdxI32,
+                              kI32, mmaLayout);
     }
+    Value next =
+        emitI8DotDecomposition(rewriter, loc, embedToInt(rewriter, loc, aChunk),
+                               embedToInt(rewriter, loc, bChunk), accElem,
+                               kLoop.getRegionIterArgs()[0]);
+    scf::YieldOp::create(rewriter, loc, next);
+    rewriter.setInsertionPointAfter(kLoop);
+    sum = kLoop.getResult(0);
   } else {
     auto aSliceTy = RankedTensorType::get(
         {tileM, 1}, aSource.tileType.getElementType(), accLayout);

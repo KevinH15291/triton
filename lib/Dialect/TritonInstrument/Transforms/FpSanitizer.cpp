@@ -1323,9 +1323,7 @@ Value unpackPackedFp4Tensor(PatternRewriter &rewriter, Location loc,
 
   Value logical =
       tt::ReshapeOp::create(rewriter, loc, logicalTy.getShape(), transposed);
-  if (logical.getType() != logicalTy)
-    logical = ttg::ConvertLayoutOp::create(rewriter, loc, logicalTy, logical);
-  return logical;
+  return ttg::ConvertLayoutOp::create(rewriter, loc, logicalTy, logical);
 }
 
 Value loadOperandK32(PatternRewriter &rewriter, Location loc, bool isLhs,

@@ -1440,6 +1440,15 @@ Value loadScaledOperandK32(PatternRewriter &rewriter, Location loc, bool isLhs,
   return payload;
 }
 
+ttg::NvidiaMmaEncodingAttr
+getI8MmaAccumulatorEncoding(PatternRewriter &rewriter, ArrayRef<int64_t> shape,
+                            Attribute accLayout, int numWarps) {
+  auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA(shape, numWarps);
+  return ttg::NvidiaMmaEncodingAttr::get(
+      rewriter.getContext(), /*versionMajor=*/2, /*versionMinor=*/0,
+      warpsPerCTA, ttg::getCGALayout(accLayout), SmallVector<unsigned>{16, 8});
+}
+
 Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
                                 Value aPayload, Value bPayload,
                                 Attribute accLayout, IntegerType accElem,
@@ -1456,8 +1465,6 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     return Value();
   if (!canUseI8MmaTile(m, n, numWarps))
     return Value();
-  auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA({m, n}, numWarps);
-
   auto aElem = cast<IntegerType>(aPayloadTy.getElementType());
   auto bElem = cast<IntegerType>(bPayloadTy.getElementType());
   assert((aElem.getWidth() % 8) == 0 && (bElem.getWidth() % 8) == 0);
@@ -1469,9 +1476,8 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
   auto *ctx = rewriter.getContext();
   auto i8Ty = rewriter.getI8Type();
   auto i32Ty = rewriter.getI32Type();
-  auto mmaLayout = ttg::NvidiaMmaEncodingAttr::get(
-      ctx, /*versionMajor=*/2, /*versionMinor=*/0, warpsPerCTA,
-      ttg::getCGALayout(accLayout), SmallVector<unsigned>{16, 8});
+  auto mmaLayout = getI8MmaAccumulatorEncoding(
+      rewriter, SmallVector<int64_t>{m, n}, accLayout, numWarps);
   auto aDotLayout = ttg::DotOperandEncodingAttr::get(ctx, 0, mmaLayout, i8Ty);
   auto bDotLayout = ttg::DotOperandEncodingAttr::get(ctx, 1, mmaLayout, i8Ty);
   auto accMmaTy = RankedTensorType::get({m, n}, i32Ty, mmaLayout);
@@ -1538,10 +1544,7 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     }
     product = emitByteDiagonal(product, diagonal);
   }
-  auto accTy = RankedTensorType::get({m, n}, i32Ty, accLayout);
-  if (product.getType() == accTy)
-    return product;
-  return ttg::ConvertLayoutOp::create(rewriter, loc, accTy, product);
+  return product;
 }
 
 std::optional<scf::ForOp> emitMmaEmulationLoops(
@@ -1586,9 +1589,6 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
   Value dOffset = arith::AddIOp::create(rewriter, loc, mDOffset, nDOffset);
   Value dTilePtr =
       tt::AddPtrOp::create(rewriter, loc, dPtr.getType(), dPtr, dOffset);
-  Value accTile = loadScratchStrided2D(rewriter, loc, dTilePtr, accTileTy,
-                                       dRowStride, dStride);
-  Value accTileI = embedToInt(rewriter, loc, accTile);
 
   Value sum;
   bool hasSharedOperand = aSource.isShared() || bSource.isShared();
@@ -1602,6 +1602,18 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
       isScaleK32Aligned(scale.aScalePtr, scale.aScaleFactor) &&
       isScaleK32Aligned(scale.bScalePtr, scale.bScaleFactor) &&
       canUseI8MmaTile(tileM, tileN, numWarps);
+  auto dTileTy = accTileTy;
+  if (canUseI8Decomposition && accElem.getWidth() <= 32) {
+    auto mmaLayout = getI8MmaAccumulatorEncoding(
+        rewriter, SmallVector<int64_t>{tileM, tileN}, accLayout, numWarps);
+    dTileTy = RankedTensorType::get({tileM, tileN}, accTileTy.getElementType(),
+                                    mmaLayout);
+  }
+  auto accTileITy = getScratchStorageType(dTileTy);
+  Value accTile = loadScratchStrided2D(rewriter, loc, dTilePtr, dTileTy,
+                                       dRowStride, dStride);
+  Value accTileI = embedToInt(rewriter, loc, accTile);
+
   if (canUseI8Decomposition) {
     if (!hasSharedOperand && !scale.computeElem && accElem.getWidth() <= 32) {
       Value aTile = loadMmaOperand(rewriter, loc, aSource, aSource.tileType,
@@ -1612,14 +1624,11 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
           rewriter, loc, embedToInt(rewriter, loc, aTile),
           embedToInt(rewriter, loc, bTile), accLayout, accElem, numWarps);
       assert(sum && "i8 decomposition eligibility must match its emitter");
-      sum = castSignedIntValueToType(rewriter, loc, sum, accTileI.getType());
+      sum = castSignedIntValueToType(rewriter, loc, sum, accTileITy);
     } else {
-      auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA({tileM, tileN}, numWarps);
-      auto mmaLayout = ttg::NvidiaMmaEncodingAttr::get(
-          rewriter.getContext(), /*versionMajor=*/2, /*versionMinor=*/0,
-          warpsPerCTA, ttg::getCGALayout(accLayout),
-          SmallVector<unsigned>{16, 8});
-      Value zeroSum = getIntConstantLike(rewriter, loc, accTileI.getType(), 0);
+      auto mmaLayout = getI8MmaAccumulatorEncoding(
+          rewriter, SmallVector<int64_t>{tileM, tileN}, accLayout, numWarps);
+      Value zeroSum = getIntConstantLike(rewriter, loc, accTileITy, 0);
       Value kUpper = arith::ConstantOp::create(rewriter, loc,
                                                rewriter.getI32IntegerAttr(k));
       Value kStep = arith::ConstantOp::create(
@@ -1646,8 +1655,7 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
           rewriter, loc, embedToInt(rewriter, loc, aChunk),
           embedToInt(rewriter, loc, bChunk), accLayout, accElem, numWarps);
       assert(partial && "K32 decomposition must be eligible");
-      partial =
-          castSignedIntValueToType(rewriter, loc, partial, accTileI.getType());
+      partial = castSignedIntValueToType(rewriter, loc, partial, accTileITy);
       Value next = arith::AddIOp::create(rewriter, loc,
                                          kLoop.getRegionIterArgs()[0], partial);
       scf::YieldOp::create(rewriter, loc, next);
@@ -1661,7 +1669,7 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
         {tileM, 1}, aSource.tileType.getElementType(), accLayout);
     auto bSliceTy = RankedTensorType::get(
         {1, tileN}, bSource.tileType.getElementType(), accLayout);
-    Value zeroSum = getIntConstantLike(rewriter, loc, accTileI.getType(), 0);
+    Value zeroSum = getIntConstantLike(rewriter, loc, accTileITy, 0);
     Value kUpper =
         arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(k));
     Value kStep =
@@ -1723,11 +1731,11 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
   Value outMasked = arith::MulIOp::create(rewriter, loc, outI, predMask);
   Value accMasked = arith::MulIOp::create(rewriter, loc, accTileI, predInv);
   Value outSelI = arith::AddIOp::create(rewriter, loc, outMasked, accMasked);
-  Value out = isFloatLike(accTileTy)
-                  ? unembedToFloat(rewriter, loc, outSelI, accTileTy)
+  Value out = isFloatLike(dTileTy)
+                  ? unembedToFloat(rewriter, loc, outSelI, dTileTy)
                   : outSelI;
   createGlobalScratchBarrier(rewriter, loc);
-  storeScratchStrided2D(rewriter, loc, dTilePtr, out, accTileTy, dRowStride,
+  storeScratchStrided2D(rewriter, loc, dTilePtr, out, dTileTy, dRowStride,
                         dStride);
   return mLoop;
 }

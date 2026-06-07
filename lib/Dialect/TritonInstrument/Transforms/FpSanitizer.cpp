@@ -53,6 +53,8 @@ static bool isValueAvailableInScope(Value value, Region *scope) {
 
 constexpr int64_t kTileM = 8;
 constexpr int64_t kTileN = 8;
+constexpr int64_t kI8MmaM = 16;
+constexpr int64_t kI8MmaN = 8;
 constexpr int64_t kI8MmaK = 32;
 
 bool supportsI8DotDecomposition(PatternRewriter &rewriter,
@@ -65,7 +67,8 @@ bool supportsI8DotDecomposition(PatternRewriter &rewriter,
 }
 
 bool canUseI8MmaTile(int64_t m, int64_t n, int numWarps) {
-  return m >= 16 && n >= 8 && (m / 16) * (n / 8) >= numWarps;
+  return m >= kI8MmaM && n >= kI8MmaN &&
+         (m / kI8MmaM) * (n / kI8MmaN) >= numWarps;
 }
 
 std::pair<int64_t, int64_t>
@@ -77,13 +80,13 @@ getMmaEmulationTileShape(PatternRewriter &rewriter, int64_t m, int64_t n,
   int64_t numWarps =
       ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
   if (supportsI8DotDecomposition(rewriter, accElem) && (k % kI8MmaK) == 0) {
-    int64_t tileM = std::min<int64_t>(16 * numWarps, m);
-    int64_t tileN = std::min<int64_t>(8 * numWarps, n);
+    int64_t tileM = std::min<int64_t>(kI8MmaM * numWarps, m);
+    int64_t tileN = std::min<int64_t>(kI8MmaN * numWarps, n);
     if (canUseI8MmaTile(tileM, tileN, numWarps))
       tile = {tileM, tileN};
   }
   if (directShared) {
-    int64_t widerN = std::min<int64_t>(16 * numWarps, n);
+    int64_t widerN = std::min<int64_t>(2 * kI8MmaN * numWarps, n);
     if (widerN > tile.second && canUseI8MmaTile(tile.first, widerN, numWarps))
       tile.second = widerN;
   }
@@ -1446,7 +1449,8 @@ getI8MmaAccumulatorEncoding(PatternRewriter &rewriter, ArrayRef<int64_t> shape,
   auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA(shape, numWarps);
   return ttg::NvidiaMmaEncodingAttr::get(
       rewriter.getContext(), /*versionMajor=*/2, /*versionMinor=*/0,
-      warpsPerCTA, ttg::getCGALayout(accLayout), SmallVector<unsigned>{16, 8});
+      warpsPerCTA, ttg::getCGALayout(accLayout),
+      SmallVector<unsigned>{kI8MmaM, kI8MmaN});
 }
 
 Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
@@ -1482,10 +1486,8 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
   auto bDotLayout = ttg::DotOperandEncodingAttr::get(ctx, 1, mmaLayout, i8Ty);
   auto aMmaTy = aPayloadTy.cloneWithEncoding(aDotLayout);
   auto bMmaTy = bPayloadTy.cloneWithEncoding(bDotLayout);
-  if (aPayload.getType() != aMmaTy)
-    aPayload = ttg::ConvertLayoutOp::create(rewriter, loc, aMmaTy, aPayload);
-  if (bPayload.getType() != bMmaTy)
-    bPayload = ttg::ConvertLayoutOp::create(rewriter, loc, bMmaTy, bPayload);
+  aPayload = ttg::ConvertLayoutOp::create(rewriter, loc, aMmaTy, aPayload);
+  bPayload = ttg::ConvertLayoutOp::create(rewriter, loc, bMmaTy, bPayload);
   auto workElem = accElem.getWidth() == 64 ? accElem : i32Ty;
   auto workMmaTy = RankedTensorType::get({m, n}, workElem, mmaLayout);
 
@@ -1493,17 +1495,27 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     unsigned axis;
     int64_t stride;
   };
-  // Peel register repetitions outside each native 16x8 fragment from the
+  // Peel register repetitions outside each native IMMA fragment from the
   // largest stride down, then reassemble them in the inverse order.
   SmallVector<FragmentSplit> fragmentSplits;
   auto mmaLinearLayout = mmaLayout.toLinearLayout({m, n});
+  auto outDims = llvm::to_vector(mmaLinearLayout.getOutDimNames());
+  assert(outDims.size() == 2);
+  auto nativeLinearLayout = mmaLinearLayout.resizeOutDim(outDims[0], kI8MmaM)
+                                .resizeOutDim(outDims[1], kI8MmaN);
   auto kRegister = StringAttr::get(ctx, "register");
   const auto &registerBases = mmaLinearLayout.getBases().lookup(kRegister);
-  for (const auto &basis : llvm::reverse(registerBases)) {
-    if (basis[0] >= 16 && basis[1] == 0)
-      fragmentSplits.push_back({0, basis[0]});
-    else if (basis[0] == 0 && basis[1] >= 8)
-      fragmentSplits.push_back({1, basis[1]});
+  const auto &nativeRegisterBases =
+      nativeLinearLayout.getBases().lookup(kRegister);
+  assert(registerBases.size() == nativeRegisterBases.size());
+  for (auto [basis, nativeBasis] :
+       llvm::reverse(llvm::zip(registerBases, nativeRegisterBases))) {
+    if (basis == nativeBasis)
+      continue;
+    assert(llvm::all_of(nativeBasis, [](int32_t value) { return value == 0; }));
+    assert((basis[0] == 0) != (basis[1] == 0));
+    unsigned axis = basis[0] == 0 ? 1 : 0;
+    fragmentSplits.push_back({axis, basis[axis]});
   }
 
   auto splitAtRegisterBasis = [&](Value tensor, unsigned axis,
@@ -1588,10 +1600,8 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     auto accMmaTy = RankedTensorType::get({tileM, tileN}, i32Ty, mmaLayout);
     auto tileWorkTy =
         RankedTensorType::get({tileM, tileN}, workElem, mmaLayout);
-    if (accumulator.getType() != tileWorkTy) {
-      accumulator =
-          ttg::ConvertLayoutOp::create(rewriter, loc, tileWorkTy, accumulator);
-    }
+    accumulator =
+        ttg::ConvertLayoutOp::create(rewriter, loc, tileWorkTy, accumulator);
 
     auto extractLimb = [&](Value payload, ttg::DotOperandEncodingAttr layout,
                            int64_t limb) -> Value {
@@ -1647,9 +1657,7 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
 
   Value product =
       emitFragments(emitFragments, aPayload, bPayload, initialAccumulator, 0);
-  if (product.getType() != workMmaTy)
-    product = ttg::ConvertLayoutOp::create(rewriter, loc, workMmaTy, product);
-  return product;
+  return ttg::ConvertLayoutOp::create(rewriter, loc, workMmaTy, product);
 }
 
 std::optional<scf::ForOp> emitMmaEmulationLoops(

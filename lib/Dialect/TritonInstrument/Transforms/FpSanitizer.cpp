@@ -1323,17 +1323,8 @@ Value unpackPackedFp4Tensor(PatternRewriter &rewriter, Location loc,
 
   Value logical =
       tt::ReshapeOp::create(rewriter, loc, logicalTy.getShape(), transposed);
-  if (logical.getType() != logicalTy) {
-    auto inferredTy = cast<RankedTensorType>(logical.getType());
-    if (ttg::areLayoutsEquivalent(
-            logicalTy.getShape(),
-            cast<ttg::LayoutEncodingTrait>(inferredTy.getEncoding()),
-            cast<ttg::LayoutEncodingTrait>(logicalTy.getEncoding()))) {
-      logical.setType(logicalTy);
-    } else {
-      logical = ttg::ConvertLayoutOp::create(rewriter, loc, logicalTy, logical);
-    }
-  }
+  if (logical.getType() != logicalTy)
+    logical = ttg::ConvertLayoutOp::create(rewriter, loc, logicalTy, logical);
   return logical;
 }
 
@@ -1348,12 +1339,9 @@ Value loadOperandK32(PatternRewriter &rewriter, Location loc, bool isLhs,
   rawShape[isLhs ? 1 : 0] /= packFactor;
   auto dotLayout = ttg::DotOperandEncodingAttr::get(
       rewriter.getContext(), !isLhs, mmaLayout, rewriter.getI8Type());
-  unsigned kWidth = dotLayout.getKWidth();
-  assert((packFactor == 1 || (kWidth % packFactor) == 0) &&
-         "packed dot layout must divide kWidth evenly");
   auto rawLayout = ttg::DotOperandEncodingAttr::get(
       rewriter.getContext(), dotLayout.getOpIdx(), dotLayout.getParent(),
-      kWidth / packFactor);
+      dotLayout.getKWidth() / packFactor);
   auto rawTy = RankedTensorType::get(rawShape, source.tileType.getElementType(),
                                      rawLayout);
 
@@ -1505,8 +1493,6 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     }
     Value truncated =
         arith::TruncIOp::create(rewriter, loc, blockedLimbTy, shifted);
-    if (truncated.getType() == dotLimbTy)
-      return truncated;
     return ttg::ConvertLayoutOp::create(rewriter, loc, dotLimbTy, truncated);
   };
 

@@ -1495,13 +1495,14 @@ Value emitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     auto tensorTy = cast<RankedTensorType>(tensor.getType());
     auto shape = llvm::to_vector(tensorTy.getShape());
     assert(shape.size() == 2 && axis < 2 && (shape[axis] % (2 * stride)) == 0);
-    SmallVector<int64_t> expandedShape =
-        axis == 0
-            ? SmallVector<int64_t>{shape[0] / (2 * stride), 2, stride, shape[1]}
-            : SmallVector<int64_t>{shape[0], shape[1] / (2 * stride), 2,
-                                   stride};
-    SmallVector<int32_t> order = axis == 0 ? SmallVector<int32_t>{0, 2, 3, 1}
-                                           : SmallVector<int32_t>{0, 1, 3, 2};
+    SmallVector<int64_t> expandedShape(shape);
+    expandedShape[axis] /= 2 * stride;
+    expandedShape.insert(expandedShape.begin() + axis + 1, 2);
+    expandedShape.insert(expandedShape.begin() + axis + 2, stride);
+    int32_t selectorAxis = axis + 1;
+    auto order = llvm::to_vector(llvm::seq<int32_t>(expandedShape.size()));
+    order.erase(order.begin() + selectorAxis);
+    order.push_back(selectorAxis);
     Value expanded =
         tt::ReshapeOp::create(rewriter, loc, expandedShape, tensor);
     Value transposed = tt::TransOp::create(rewriter, loc, expanded, order);
@@ -1518,13 +1519,12 @@ Value emitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
     auto fullShape = llvm::to_vector(halfTy.getShape());
     assert(fullShape.size() == 2 && axis < 2);
     fullShape[axis] *= 2;
-    SmallVector<int64_t> expandedHalfShape =
-        axis == 0 ? SmallVector<int64_t>{fullShape[0] / (2 * stride), stride,
-                                         fullShape[1]}
-                  : SmallVector<int64_t>{fullShape[0],
-                                         fullShape[1] / (2 * stride), stride};
-    SmallVector<int32_t> order = axis == 0 ? SmallVector<int32_t>{0, 3, 1, 2}
-                                           : SmallVector<int32_t>{0, 1, 3, 2};
+    SmallVector<int64_t> expandedHalfShape(fullShape);
+    expandedHalfShape[axis] /= 2 * stride;
+    expandedHalfShape.insert(expandedHalfShape.begin() + axis + 1, stride);
+    int32_t joinAxis = expandedHalfShape.size();
+    auto order = llvm::to_vector(llvm::seq<int32_t>(joinAxis));
+    order.insert(order.begin() + axis + 1, joinAxis);
     lhs = tt::ReshapeOp::create(rewriter, loc, expandedHalfShape, lhs);
     rhs = tt::ReshapeOp::create(rewriter, loc, expandedHalfShape, rhs);
     Value joined = tt::JoinOp::create(rewriter, loc, lhs, rhs);

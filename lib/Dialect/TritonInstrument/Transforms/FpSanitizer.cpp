@@ -1452,7 +1452,7 @@ getI8MmaAccumulatorEncoding(PatternRewriter &rewriter, ArrayRef<int64_t> shape,
 Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
                                 Value aPayload, Value bPayload,
                                 Attribute accLayout, IntegerType accElem,
-                                int numWarps) {
+                                int numWarps, Value initialAccumulator) {
   auto aPayloadTy = cast<RankedTensorType>(aPayload.getType());
   auto bPayloadTy = cast<RankedTensorType>(bPayload.getType());
   auto aShape = aPayloadTy.getShape();
@@ -1480,70 +1480,175 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
       rewriter, SmallVector<int64_t>{m, n}, accLayout, numWarps);
   auto aDotLayout = ttg::DotOperandEncodingAttr::get(ctx, 0, mmaLayout, i8Ty);
   auto bDotLayout = ttg::DotOperandEncodingAttr::get(ctx, 1, mmaLayout, i8Ty);
-  auto accMmaTy = RankedTensorType::get({m, n}, i32Ty, mmaLayout);
+  auto aMmaTy = aPayloadTy.cloneWithEncoding(aDotLayout);
+  auto bMmaTy = bPayloadTy.cloneWithEncoding(bDotLayout);
+  if (aPayload.getType() != aMmaTy)
+    aPayload = ttg::ConvertLayoutOp::create(rewriter, loc, aMmaTy, aPayload);
+  if (bPayload.getType() != bMmaTy)
+    bPayload = ttg::ConvertLayoutOp::create(rewriter, loc, bMmaTy, bPayload);
+  auto workElem = accElem.getWidth() == 64 ? accElem : i32Ty;
+  auto workMmaTy = RankedTensorType::get({m, n}, workElem, mmaLayout);
 
-  auto extractLimb = [&](Value payload, ttg::DotOperandEncodingAttr layout,
-                         int64_t limb) -> Value {
-    auto payloadTy = cast<RankedTensorType>(payload.getType());
-    auto blockedLimbTy = payloadTy.clone(i8Ty);
-    auto dotLimbTy = blockedLimbTy.cloneWithEncoding(layout);
-    Value shifted = payload;
-    if (limb != 0) {
-      Value shift = getIntConstantLike(rewriter, loc, payloadTy, 8 * limb);
-      shifted = arith::ShRUIOp::create(rewriter, loc, shifted, shift);
-    }
-    Value truncated =
-        arith::TruncIOp::create(rewriter, loc, blockedLimbTy, shifted);
-    return ttg::ConvertLayoutOp::create(rewriter, loc, dotLimbTy, truncated);
+  struct FragmentSplit {
+    unsigned axis;
+    int64_t stride;
   };
-
-  auto emitByteDiagonal = [&](Value sum, int64_t diagonal) {
-    int64_t firstALimb = std::max<int64_t>(0, diagonal - bLimbs + 1);
-    int64_t lastALimb = std::min(diagonal, aLimbs - 1);
-    for (int64_t aLimb = firstALimb; aLimb <= lastALimb; ++aLimb) {
-      int64_t bLimb = diagonal - aLimb;
-      Value a = extractLimb(aPayload, aDotLayout, aLimb);
-      Value b = extractLimb(bPayload, bDotLayout, bLimb);
-      auto dot = DotI8Op::create(rewriter, loc, accMmaTy, a, b, sum,
-                                 aLimb == aLimbs - 1, bLimb == bLimbs - 1);
-      sum = dot.getResult();
-    }
-    return sum;
-  };
-
-  if (accElem.getWidth() == 64) {
-    // Complete each K32 byte diagonal in i32 before widening it.  The largest
-    // diagonal is 8 * kI8MmaK * 255^2 < 2^24, so its i32 result is exact.
-    auto accTy = RankedTensorType::get({m, n}, accElem, accLayout);
-    Value product = getIntConstantLike(rewriter, loc, accTy, 0);
-    for (int64_t diagonal = highestDiagonal; diagonal >= 0; --diagonal) {
-      if (diagonal != highestDiagonal) {
-        Value shift = getIntConstantLike(rewriter, loc, accTy, 8);
-        product = arith::ShLIOp::create(rewriter, loc, product, shift);
-      }
-
-      Value diagonalSum = getIntConstantLike(rewriter, loc, accMmaTy, 0);
-      diagonalSum = emitByteDiagonal(diagonalSum, diagonal);
-      auto diagonalTy = RankedTensorType::get({m, n}, i32Ty, accLayout);
-      if (diagonalSum.getType() != diagonalTy) {
-        diagonalSum = ttg::ConvertLayoutOp::create(rewriter, loc, diagonalTy,
-                                                   diagonalSum);
-      }
-      Value diagonalWide =
-          arith::ExtSIOp::create(rewriter, loc, accTy, diagonalSum);
-      product = arith::AddIOp::create(rewriter, loc, product, diagonalWide);
-    }
-    return product;
+  // Peel register repetitions outside each native 16x8 fragment from the
+  // largest stride down, then reassemble them in the inverse order.
+  SmallVector<FragmentSplit> fragmentSplits;
+  auto mmaLinearLayout = mmaLayout.toLinearLayout({m, n});
+  auto kRegister = StringAttr::get(ctx, "register");
+  const auto &registerBases = mmaLinearLayout.getBases().lookup(kRegister);
+  for (const auto &basis : llvm::reverse(registerBases)) {
+    if (basis[0] >= 16 && basis[1] == 0)
+      fragmentSplits.push_back({0, basis[0]});
+    else if (basis[0] == 0 && basis[1] >= 8)
+      fragmentSplits.push_back({1, basis[1]});
   }
 
-  Value product = getIntConstantLike(rewriter, loc, accMmaTy, 0);
-  for (int64_t diagonal = highestDiagonal; diagonal >= 0; --diagonal) {
-    if (diagonal != highestDiagonal) {
-      Value shift = getIntConstantLike(rewriter, loc, accMmaTy, 8);
-      product = arith::ShLIOp::create(rewriter, loc, product, shift);
+  auto splitAtRegisterBasis = [&](Value tensor, unsigned axis,
+                                  int64_t stride) -> std::pair<Value, Value> {
+    auto tensorTy = cast<RankedTensorType>(tensor.getType());
+    auto shape = llvm::to_vector(tensorTy.getShape());
+    assert(axis < shape.size() && (shape[axis] % (2 * stride)) == 0);
+
+    SmallVector<int64_t> expandedShape;
+    llvm::append_range(expandedShape, ArrayRef(shape).take_front(axis));
+    expandedShape.push_back(shape[axis] / (2 * stride));
+    expandedShape.push_back(2);
+    expandedShape.push_back(stride);
+    llvm::append_range(expandedShape, llvm::drop_begin(shape, axis + 1));
+    Value expanded =
+        tt::ReshapeOp::create(rewriter, loc, expandedShape, tensor);
+
+    unsigned selectorAxis = axis + 1;
+    SmallVector<int32_t> order;
+    for (int32_t dim = 0; dim < static_cast<int32_t>(expandedShape.size());
+         ++dim)
+      if (dim != selectorAxis)
+        order.push_back(dim);
+    order.push_back(selectorAxis);
+    Value transposed = tt::TransOp::create(rewriter, loc, expanded, order);
+    auto split = tt::SplitOp::create(rewriter, loc, transposed);
+
+    shape[axis] /= 2;
+    return {tt::ReshapeOp::create(rewriter, loc, shape, split.getOutLHS()),
+            tt::ReshapeOp::create(rewriter, loc, shape, split.getOutRHS())};
+  };
+
+  auto joinAtRegisterBasis = [&](Value lhs, Value rhs, unsigned axis,
+                                 int64_t stride) -> Value {
+    auto halfTy = cast<RankedTensorType>(lhs.getType());
+    auto fullShape = llvm::to_vector(halfTy.getShape());
+    fullShape[axis] *= 2;
+
+    SmallVector<int64_t> expandedHalfShape;
+    llvm::append_range(expandedHalfShape, ArrayRef(fullShape).take_front(axis));
+    expandedHalfShape.push_back(fullShape[axis] / (2 * stride));
+    expandedHalfShape.push_back(stride);
+    llvm::append_range(expandedHalfShape,
+                       llvm::drop_begin(fullShape, axis + 1));
+    lhs = tt::ReshapeOp::create(rewriter, loc, expandedHalfShape, lhs);
+    rhs = tt::ReshapeOp::create(rewriter, loc, expandedHalfShape, rhs);
+    Value joined = tt::JoinOp::create(rewriter, loc, lhs, rhs);
+
+    SmallVector<int32_t> order;
+    for (int32_t dim = 0; dim <= static_cast<int32_t>(axis); ++dim)
+      order.push_back(dim);
+    order.push_back(expandedHalfShape.size());
+    for (int32_t dim = axis + 1;
+         dim < static_cast<int32_t>(expandedHalfShape.size()); ++dim)
+      order.push_back(dim);
+    Value transposed = tt::TransOp::create(rewriter, loc, joined, order);
+    return tt::ReshapeOp::create(rewriter, loc, fullShape, transposed);
+  };
+
+  auto emitFragments = [&](auto &&self, Value a, Value b, Value accumulator,
+                           unsigned splitIdx) -> Value {
+    if (splitIdx < fragmentSplits.size()) {
+      auto [axis, stride] = fragmentSplits[splitIdx];
+      std::pair<Value, Value> aHalves{a, a};
+      std::pair<Value, Value> bHalves{b, b};
+      if (axis == 0)
+        aHalves = splitAtRegisterBasis(a, axis, stride);
+      else
+        bHalves = splitAtRegisterBasis(b, axis, stride);
+      auto accHalves = splitAtRegisterBasis(accumulator, axis, stride);
+      Value lhs = self(self, aHalves.first, bHalves.first, accHalves.first,
+                       splitIdx + 1);
+      Value rhs = self(self, aHalves.second, bHalves.second, accHalves.second,
+                       splitIdx + 1);
+      return joinAtRegisterBasis(lhs, rhs, axis, stride);
     }
-    product = emitByteDiagonal(product, diagonal);
-  }
+
+    auto aTy = cast<RankedTensorType>(a.getType());
+    auto bTy = cast<RankedTensorType>(b.getType());
+    int64_t tileM = aTy.getShape()[0];
+    int64_t tileN = bTy.getShape()[1];
+    auto accMmaTy = RankedTensorType::get({tileM, tileN}, i32Ty, mmaLayout);
+    auto tileWorkTy =
+        RankedTensorType::get({tileM, tileN}, workElem, mmaLayout);
+    if (accumulator.getType() != tileWorkTy) {
+      accumulator =
+          ttg::ConvertLayoutOp::create(rewriter, loc, tileWorkTy, accumulator);
+    }
+
+    auto extractLimb = [&](Value payload, ttg::DotOperandEncodingAttr layout,
+                           int64_t limb) -> Value {
+      auto payloadTy = cast<RankedTensorType>(payload.getType());
+      auto limbTy = payloadTy.clone(i8Ty);
+      auto dotLimbTy = limbTy.cloneWithEncoding(layout);
+      Value shifted = payload;
+      if (limb != 0) {
+        Value shift = getIntConstantLike(rewriter, loc, payloadTy, 8 * limb);
+        shifted = arith::ShRUIOp::create(rewriter, loc, shifted, shift);
+      }
+      Value truncated = arith::TruncIOp::create(rewriter, loc, limbTy, shifted);
+      return ttg::ConvertLayoutOp::create(rewriter, loc, dotLimbTy, truncated);
+    };
+
+    for (int64_t diagonal = 0; diagonal <= highestDiagonal; ++diagonal) {
+      bool accumulateDirectly = diagonal == 0 && workElem == i32Ty;
+      Value diagonalSum = accumulateDirectly
+                              ? accumulator
+                              : getIntConstantLike(rewriter, loc, accMmaTy, 0);
+      int64_t firstALimb = std::max<int64_t>(0, diagonal - bLimbs + 1);
+      int64_t lastALimb = std::min(diagonal, aLimbs - 1);
+      for (int64_t aLimb = firstALimb; aLimb <= lastALimb; ++aLimb) {
+        int64_t bLimb = diagonal - aLimb;
+        Value aLimbValue = extractLimb(a, aDotLayout, aLimb);
+        Value bLimbValue = extractLimb(b, bDotLayout, bLimb);
+        diagonalSum = DotI8Op::create(rewriter, loc, accMmaTy, aLimbValue,
+                                      bLimbValue, diagonalSum,
+                                      aLimb == aLimbs - 1, bLimb == bLimbs - 1);
+      }
+      if (accumulateDirectly) {
+        accumulator = diagonalSum;
+        continue;
+      }
+
+      Value contribution = diagonalSum;
+      if (accElem.getWidth() == 64) {
+        // K32 keeps each completed diagonal exact in i32 before extension.
+        contribution =
+            arith::ExtSIOp::create(rewriter, loc, tileWorkTy, contribution);
+      }
+      if (diagonal != 0) {
+        Value shift =
+            getIntConstantLike(rewriter, loc, tileWorkTy, 8 * diagonal);
+        contribution =
+            arith::ShLIOp::create(rewriter, loc, contribution, shift);
+      }
+      accumulator =
+          arith::AddIOp::create(rewriter, loc, accumulator, contribution);
+    }
+    return accumulator;
+  };
+
+  Value product =
+      emitFragments(emitFragments, aPayload, bPayload, initialAccumulator, 0);
+  if (product.getType() != workMmaTy)
+    product = ttg::ConvertLayoutOp::create(rewriter, loc, workMmaTy, product);
   return product;
 }
 
@@ -1603,8 +1708,9 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
       isScaleK32Aligned(scale.bScalePtr, scale.bScaleFactor) &&
       canUseI8MmaTile(tileM, tileN, numWarps);
   auto dTileTy = accTileTy;
-  if (canUseI8Decomposition && accElem.getWidth() <= 32) {
-    auto mmaLayout = getI8MmaAccumulatorEncoding(
+  ttg::NvidiaMmaEncodingAttr mmaLayout;
+  if (canUseI8Decomposition) {
+    mmaLayout = getI8MmaAccumulatorEncoding(
         rewriter, SmallVector<int64_t>{tileM, tileN}, accLayout, numWarps);
     dTileTy = RankedTensorType::get({tileM, tileN}, accTileTy.getElementType(),
                                     mmaLayout);
@@ -1613,6 +1719,20 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
   Value accTile = loadScratchStrided2D(rewriter, loc, dTilePtr, dTileTy,
                                        dRowStride, dStride);
   Value accTileI = embedToInt(rewriter, loc, accTile);
+  Value accumulator = accTileI;
+  Value useD = useDInt;
+  Value pred = predInt;
+  if (canUseI8Decomposition) {
+    auto workElem = accElem.getWidth() == 64 ? accElem : rewriter.getI32Type();
+    auto workTy = RankedTensorType::get({tileM, tileN}, workElem, mmaLayout);
+    accumulator = castSignedIntValueToType(rewriter, loc, accumulator, workTy);
+    useD = castSignedIntValueToType(rewriter, loc, useD, workElem);
+    pred = castSignedIntValueToType(rewriter, loc, pred, workElem);
+  }
+  Value useDMask =
+      tt::SplatOp::create(rewriter, loc, accumulator.getType(), useD);
+  Value accInit = arith::MulIOp::create(rewriter, loc, accumulator, useDMask);
+  bool sumIncludesD = false;
 
   if (canUseI8Decomposition) {
     if (!hasSharedOperand && !scale.computeElem && accElem.getWidth() <= 32) {
@@ -1620,21 +1740,19 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
                                    /*isLhs=*/true, mIdxI32, zero);
       Value bTile = loadMmaOperand(rewriter, loc, bSource, bSource.tileType,
                                    /*isLhs=*/false, nIdxI32, zero);
-      sum = tryEmitI8DotDecomposition(
-          rewriter, loc, embedToInt(rewriter, loc, aTile),
-          embedToInt(rewriter, loc, bTile), accLayout, accElem, numWarps);
+      sum = tryEmitI8DotDecomposition(rewriter, loc,
+                                      embedToInt(rewriter, loc, aTile),
+                                      embedToInt(rewriter, loc, bTile),
+                                      accLayout, accElem, numWarps, accInit);
       assert(sum && "i8 decomposition eligibility must match its emitter");
-      sum = castSignedIntValueToType(rewriter, loc, sum, accTileITy);
+      sumIncludesD = true;
     } else {
-      auto mmaLayout = getI8MmaAccumulatorEncoding(
-          rewriter, SmallVector<int64_t>{tileM, tileN}, accLayout, numWarps);
-      Value zeroSum = getIntConstantLike(rewriter, loc, accTileITy, 0);
       Value kUpper = arith::ConstantOp::create(rewriter, loc,
                                                rewriter.getI32IntegerAttr(k));
       Value kStep = arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(kI8MmaK));
       auto kLoop =
-          scf::ForOp::create(rewriter, loc, zero, kUpper, kStep, zeroSum);
+          scf::ForOp::create(rewriter, loc, zero, kUpper, kStep, accInit);
       rewriter.setInsertionPointToStart(kLoop.getBody());
       Value kIdx = kLoop.getInductionVar();
       Value kI32 = arith::IndexCastOp::create(rewriter, loc, i32Ty, kIdx);
@@ -1651,16 +1769,15 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
         bChunk = loadOperandK32(rewriter, loc, /*isLhs=*/false, bSource,
                                 nIdxI32, kI32, mmaLayout);
       }
-      Value partial = tryEmitI8DotDecomposition(
+      Value next = tryEmitI8DotDecomposition(
           rewriter, loc, embedToInt(rewriter, loc, aChunk),
-          embedToInt(rewriter, loc, bChunk), accLayout, accElem, numWarps);
-      assert(partial && "K32 decomposition must be eligible");
-      partial = castSignedIntValueToType(rewriter, loc, partial, accTileITy);
-      Value next = arith::AddIOp::create(rewriter, loc,
-                                         kLoop.getRegionIterArgs()[0], partial);
+          embedToInt(rewriter, loc, bChunk), accLayout, accElem, numWarps,
+          kLoop.getRegionIterArgs()[0]);
+      assert(next && "K32 decomposition must be eligible");
       scf::YieldOp::create(rewriter, loc, next);
       rewriter.setInsertionPointAfter(kLoop);
       sum = kLoop.getResult(0);
+      sumIncludesD = true;
     }
   }
 
@@ -1719,18 +1836,18 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
     sum = kLoop.getResult(0);
   }
 
-  Value useDMask =
-      tt::SplatOp::create(rewriter, loc, accTileI.getType(), useDInt);
-  Value accInitI = arith::MulIOp::create(rewriter, loc, accTileI, useDMask);
-  Value outI = arith::AddIOp::create(rewriter, loc, sum, accInitI);
+  Value outI =
+      sumIncludesD ? sum : arith::AddIOp::create(rewriter, loc, sum, accInit);
 
   Value predMask =
-      tt::SplatOp::create(rewriter, loc, accTileI.getType(), predInt);
-  Value oneI = getIntConstantLike(rewriter, loc, accTileI.getType(), 1);
+      tt::SplatOp::create(rewriter, loc, accumulator.getType(), pred);
+  Value oneI = getIntConstantLike(rewriter, loc, accumulator.getType(), 1);
   Value predInv = arith::SubIOp::create(rewriter, loc, oneI, predMask);
   Value outMasked = arith::MulIOp::create(rewriter, loc, outI, predMask);
-  Value accMasked = arith::MulIOp::create(rewriter, loc, accTileI, predInv);
+  Value accMasked = arith::MulIOp::create(rewriter, loc, accumulator, predInv);
   Value outSelI = arith::AddIOp::create(rewriter, loc, outMasked, accMasked);
+  if (outSelI.getType() != accTileITy)
+    outSelI = castSignedIntValueToType(rewriter, loc, outSelI, accTileITy);
   Value out = isFloatLike(dTileTy)
                   ? unembedToFloat(rewriter, loc, outSelI, dTileTy)
                   : outSelI;

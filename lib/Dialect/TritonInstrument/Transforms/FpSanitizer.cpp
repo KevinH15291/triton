@@ -1065,8 +1065,7 @@ Value loadMmaOperand(PatternRewriter &rewriter, Location loc,
   unsigned tileAxis = isLhs ? 0 : 1;
   unsigned kAxis = 1 - tileAxis;
   ArrayRef<int64_t> loadShape = resultTy.getShape();
-  auto loadLayout =
-      cast<ttg::DistributedEncodingTrait>(resultTy.getEncoding());
+  auto loadLayout = cast<ttg::DistributedEncodingTrait>(resultTy.getEncoding());
   auto indicesTy = resultTy.clone(rewriter.getI32Type());
   auto kEncoding = getSingleDimSliceEncoding(loadLayout, kAxis);
   auto kTy = RankedTensorType::get({loadShape[kAxis]}, rewriter.getI32Type(),
@@ -1083,9 +1082,9 @@ Value loadMmaOperand(PatternRewriter &rewriter, Location loc,
       arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
   SmallVector<Value> offsets(2, zero);
   offsets[tileAxis] = tileOffset;
-  return ExperimentalLocalGatherOp::create(
-      rewriter, loc, resultTy, shared, indices, offsets,
-      rewriter.getI32IntegerAttr(kAxis));
+  return ExperimentalLocalGatherOp::create(rewriter, loc, resultTy, shared,
+                                           indices, offsets,
+                                           rewriter.getI32IntegerAttr(kAxis));
 }
 
 Operation *storeScratchStrided2D(PatternRewriter &rewriter, Location loc,
@@ -1353,8 +1352,8 @@ Value loadOperandK32(PatternRewriter &rewriter, Location loc, bool isLhs,
       loadMmaOperand(rewriter, loc, source, rawTy, isLhs, tileIdx, packedKIdx);
 
   if (packFactor == 2) {
-    auto logicalTy = RankedTensorType::get(logicalShape, rewriter.getI8Type(),
-                                           dotLayout);
+    auto logicalTy =
+        RankedTensorType::get(logicalShape, rewriter.getI8Type(), dotLayout);
     chunk = unpackPackedFp4Tensor(rewriter, loc, chunk,
                                   /*axis=*/isLhs ? 1 : 0, logicalTy);
   }
@@ -1425,13 +1424,11 @@ Value loadScaledScaleK32(PatternRewriter &rewriter, Location loc, bool isLhs,
 Value loadScaledOperandK32(PatternRewriter &rewriter, Location loc, bool isLhs,
                            const MmaOperandSource &source,
                            const DotScaleConfig &scale, Value tileIdx,
-                           Value kI32,
-                           ttg::NvidiaMmaEncodingAttr mmaLayout) {
+                           Value kI32, ttg::NvidiaMmaEncodingAttr mmaLayout) {
   int64_t packFactor = isLhs ? scale.aKPackFactor : scale.bKPackFactor;
   tt::ScaleDotElemType elemType = isLhs ? scale.aElemType : scale.bElemType;
-  Value chunk =
-      loadOperandK32(rewriter, loc, isLhs, source, tileIdx, kI32, mmaLayout,
-                     packFactor);
+  Value chunk = loadOperandK32(rewriter, loc, isLhs, source, tileIdx, kI32,
+                               mmaLayout, packFactor);
 
   Value payload = castDotScaledOperandToComputePayload(
       rewriter, loc, chunk, elemType, scale.computeElem);
@@ -1617,8 +1614,7 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
       assert(sum && "i8 decomposition eligibility must match its emitter");
       sum = castSignedIntValueToType(rewriter, loc, sum, accTileI.getType());
     } else {
-      auto warpsPerCTA =
-          ttg::getMmaV2WarpsPerCTA({tileM, tileN}, numWarps);
+      auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA({tileM, tileN}, numWarps);
       auto mmaLayout = ttg::NvidiaMmaEncodingAttr::get(
           rewriter.getContext(), /*versionMajor=*/2, /*versionMinor=*/0,
           warpsPerCTA, ttg::getCGALayout(accLayout),
@@ -2714,12 +2710,10 @@ struct TCGen5MMAScaledPattern
         arith::ExtUIOp::create(rewriter, loc, accElem, op.getPred());
 
     rewriter.setInsertionPoint(op);
-    auto aScaleScratch =
-        scratch->getOrCreate(op.getAScale(), rewriter, scope);
+    auto aScaleScratch = scratch->getOrCreate(op.getAScale(), rewriter, scope);
     if (!aScaleScratch)
       return emitFpSanCodegenError(op.getOperation());
-    auto bScaleScratch =
-        scratch->getOrCreate(op.getBScale(), rewriter, scope);
+    auto bScaleScratch = scratch->getOrCreate(op.getBScale(), rewriter, scope);
     if (!bScaleScratch)
       return emitFpSanCodegenError(op.getOperation());
 

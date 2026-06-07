@@ -1499,23 +1499,13 @@ Value tryEmitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
   // largest stride down, then reassemble them in the inverse order.
   SmallVector<FragmentSplit> fragmentSplits;
   auto mmaLinearLayout = mmaLayout.toLinearLayout({m, n});
-  auto outDims = llvm::to_vector(mmaLinearLayout.getOutDimNames());
-  assert(outDims.size() == 2);
-  auto nativeLinearLayout = mmaLinearLayout.resizeOutDim(outDims[0], kI8MmaM)
-                                .resizeOutDim(outDims[1], kI8MmaN);
   auto kRegister = StringAttr::get(ctx, "register");
   const auto &registerBases = mmaLinearLayout.getBases().lookup(kRegister);
-  const auto &nativeRegisterBases =
-      nativeLinearLayout.getBases().lookup(kRegister);
-  assert(registerBases.size() == nativeRegisterBases.size());
-  for (auto [basis, nativeBasis] :
-       llvm::reverse(llvm::zip(registerBases, nativeRegisterBases))) {
-    if (basis == nativeBasis)
-      continue;
-    assert(llvm::all_of(nativeBasis, [](int32_t value) { return value == 0; }));
-    assert((basis[0] == 0) != (basis[1] == 0));
-    unsigned axis = basis[0] == 0 ? 1 : 0;
-    fragmentSplits.push_back({axis, basis[axis]});
+  for (const auto &basis : llvm::reverse(registerBases)) {
+    if (basis[0] >= kI8MmaM && basis[1] == 0)
+      fragmentSplits.push_back({0, basis[0]});
+    else if (basis[0] == 0 && basis[1] >= kI8MmaN)
+      fragmentSplits.push_back({1, basis[1]});
   }
 
   auto splitAtRegisterBasis = [&](Value tensor, unsigned axis,

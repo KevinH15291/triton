@@ -364,7 +364,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
 #smem = #ttg.shared_memory
 #blocked_multibuffer = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1], CGALayout = [[1, 0]]}>
+#blocked_copy = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1], CGALayout = [[0, 0]]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]], twoCTAs = true>
+#tmem_copy_alias = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[0, 0]]>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<CGALayout = [[0, 0]]>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.tensor_memory_size = 0 : i32, "ttg.total-num-warps" = 1 : i32} {
   tt.func public @enable_two_ctas() {
@@ -393,16 +395,20 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   }
 
   // CHECK-LABEL: @tmem_copy_commit_two_ctas
-  tt.func public @tmem_copy_commit_two_ctas() {
-    // CHECK: ttg.global_scratch_alloc {{.*}}shared_cluster_state
+  tt.func public @tmem_copy_commit_two_ctas() -> tensor<128x128xi8, #blocked_copy> {
+    // CHECK: ttg.global_scratch_alloc {{.*}}nbytes = 20480{{.*}}shared_cluster_state
     // CHECK-NOT: ttng.tmem_copy
     // CHECK: ttng.cluster_barrier
     // CHECK-NEXT: {{.*}} = ttg.local_load
+    // CHECK-COUNT-5: tt.store
+    // CHECK-NOT: tt.store
     // CHECK: ttg.barrier global_read|global_write
     // CHECK-NEXT: ttng.cluster_barrier
     // CHECK: ttg.barrier global_read|global_write
     // CHECK-NEXT: ttng.cluster_barrier
     // CHECK: ttng.arrive_barrier
+    // CHECK: tt.load
+    // CHECK-NOT: ttng.tmem_load
     // CHECK-NOT: ttng.tc_gen5_commit
     %true = arith.constant true
     %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x32xi8, #shared_copy, #smem, mutable>
@@ -410,7 +416,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     %bar = ttg.local_alloc {allocation.offset = 8192 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.tmem_copy %src, %dst : !ttg.memdesc<128x32xi8, #shared_copy, #smem, mutable>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     ttng.tc_gen5_commit %bar, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    tt.return
+    %alias = ttg.memdesc_reinterpret %dst : !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xi8, #tmem_copy_alias, #ttng.tensor_memory, mutable>
+    %val = ttng.tmem_load %alias : !ttg.memdesc<128x128xi8, #tmem_copy_alias, #ttng.tensor_memory, mutable> -> tensor<128x128xi8, #blocked_copy>
+    tt.return %val : tensor<128x128xi8, #blocked_copy>
   }
 }
 

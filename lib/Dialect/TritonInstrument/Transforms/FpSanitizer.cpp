@@ -165,6 +165,8 @@ ttg::BlockedEncodingAttr getOptimizedBlockedEncoding(PatternRewriter &rewriter,
 struct ScratchInfo {
   Value ptr;
   RankedTensorType tensorType;
+  bool hasScalePhysicalShadow = false;
+  bool isScalePhysicalView = false;
 };
 
 struct MmaOperandSource {
@@ -223,6 +225,15 @@ Operation *storeFpSanScratchMemory(PatternRewriter &rewriter, Location loc,
     stored = embedToInt(rewriter, loc, tensor);
   return createStoreScratchMemory(rewriter, loc, alloc, stored, storageTy);
 }
+
+LogicalResult storeFpSanScaleScratchPhysical(PatternRewriter &rewriter,
+                                             Location loc, Value alloc,
+                                             Value tensor,
+                                             RankedTensorType tensorTy,
+                                             ttg::MemDescType scaleMemTy);
+Value createPointerTensorStrided2D(PatternRewriter &rewriter, Location loc,
+                                   Value base, RankedTensorType resultTy,
+                                   int64_t stride0, int64_t stride1);
 
 class TmemScratchManager {
 public:
@@ -313,7 +324,9 @@ public:
       if (state.canonical) {
         Value ptr =
             remapToScope(state.canonical->ptr, rewriter, scope, alloc.getLoc());
-        ScratchInfo info{ptr, state.canonical->tensorType};
+        ScratchInfo info{ptr, state.canonical->tensorType,
+                         state.canonical->hasScalePhysicalShadow,
+                         state.canonical->isScalePhysicalView};
         state.byScope[scope] = info;
         return info;
       }
@@ -326,9 +339,51 @@ public:
                                             memTy.getElementType(), layout);
       auto storageElemTy = getScratchStorageElementType(memTy.getElementType());
 
+      bool hasScalePhysicalShadow = false;
+      if (isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding())) {
+        // Scaled MMA uses the compact logical matrix. Only reserve the
+        // four-copy hardware representation when a reinterpret exposes it.
+        SmallVector<Value> worklist{memdesc};
+        DenseSet<Value> visited;
+        while (!worklist.empty() && !hasScalePhysicalShadow) {
+          Value current = worklist.pop_back_val();
+          if (!visited.insert(current).second)
+            continue;
+          for (OpOperand &use : current.getUses()) {
+            Operation *owner = use.getOwner();
+            if (auto view = dyn_cast<ttg::MemDescReinterpretOp>(owner)) {
+              auto viewTy = cast<ttg::MemDescType>(view.getType());
+              if (!isa<ttng::TensorMemoryScalesEncodingAttr>(
+                      viewTy.getEncoding())) {
+                hasScalePhysicalShadow = true;
+                break;
+              }
+              worklist.push_back(view.getResult());
+            } else if (auto view = dyn_cast<ttg::MemDescIndexOp>(owner)) {
+              worklist.push_back(view.getResult());
+            } else if (auto view = dyn_cast<ttng::TMEMSubSliceOp>(owner)) {
+              worklist.push_back(view.getResult());
+            } else if (auto partitions =
+                           dyn_cast<ttg::WarpSpecializePartitionsOp>(owner)) {
+              for (Region &region : partitions.getPartitionRegions())
+                worklist.push_back(region.getArgument(use.getOperandNumber()));
+            }
+          }
+        }
+      }
+
       int64_t elSize = memTy.getElementType().getIntOrFloatBitWidth() / 8;
       int64_t alignment = std::max<int64_t>(elSize, 16);
       int64_t sizeInBytes = product(memTy.getShape()) * elSize;
+      if (hasScalePhysicalShadow) {
+        if (memTy.getElementType().getIntOrFloatBitWidth() != 8 ||
+            memTy.getShape()[0] % 32 != 0 || memTy.getShape()[1] % 4 != 0)
+          return std::nullopt;
+        auto allocSize = ttng::getTmemAllocSizes(memTy);
+        if (allocSize.numRows != 128)
+          return std::nullopt;
+        sizeInBytes += 4 * product(memTy.getShape());
+      }
       auto ptrTy = triton::getPointerType(storageElemTy);
       auto allocOp =
           createScratchAlloc(rewriter, loc, ptrTy, sizeInBytes, alignment);
@@ -338,13 +393,18 @@ public:
         auto initTy = cast<RankedTensorType>(init.getType());
         if (!storeFpSanScratchMemory(rewriter, loc, ptr, init, initTy))
           return std::nullopt;
+        if (hasScalePhysicalShadow) {
+          if (failed(storeFpSanScaleScratchPhysical(rewriter, loc, ptr, init,
+                                                    initTy, memTy)))
+            return std::nullopt;
+        }
         createGlobalScratchBarrier(rewriter, loc, sharedClusterState);
       }
 
-      state.canonical = ScratchInfo{ptr, tensorTy};
+      state.canonical = ScratchInfo{ptr, tensorTy, hasScalePhysicalShadow};
 
       ptr = remapToScope(ptr, rewriter, scope, loc);
-      ScratchInfo info{ptr, tensorTy};
+      ScratchInfo info{ptr, tensorTy, hasScalePhysicalShadow};
       state.byScope[scope] = info;
       return info;
     }
@@ -378,7 +438,8 @@ public:
       auto tensorTy = RankedTensorType::get(memTy.getShape(),
                                             memTy.getElementType(), layout);
 
-      ScratchInfo info{ptr, tensorTy};
+      ScratchInfo info{ptr, tensorTy, baseInfo->hasScalePhysicalShadow,
+                       baseInfo->isScalePhysicalView};
       return info;
     }
 
@@ -408,7 +469,8 @@ public:
       auto tensorTy = RankedTensorType::get(memTy.getShape(),
                                             memTy.getElementType(), layout);
 
-      ScratchInfo info{ptr, tensorTy};
+      ScratchInfo info{ptr, tensorTy, baseInfo->hasScalePhysicalShadow,
+                       baseInfo->isScalePhysicalView};
       return info;
     }
 
@@ -421,6 +483,21 @@ public:
       rewriter.setInsertionPoint(view);
       auto loc = view.getLoc();
       Value ptr = baseInfo->ptr;
+      auto baseTy = cast<ttg::MemDescType>(view.getSrc().getType());
+      bool scaleToPhysical =
+          isa<ttng::TensorMemoryScalesEncodingAttr>(baseTy.getEncoding()) &&
+          !isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding());
+      if (baseInfo->isScalePhysicalView &&
+          isa<ttng::TensorMemoryScalesEncodingAttr>(memTy.getEncoding()))
+        return std::nullopt;
+      if (scaleToPhysical) {
+        if (!baseInfo->hasScalePhysicalShadow)
+          return std::nullopt;
+        auto offset = arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(product(baseTy.getShape())));
+        ptr = tt::AddPtrOp::create(rewriter, loc, ptr.getType(), ptr, offset);
+      }
       auto ptrTy = triton::getPointerType(
           getScratchStorageElementType(memTy.getElementType()));
       if (ptr.getType() != ptrTy) {
@@ -432,7 +509,9 @@ public:
       auto tensorTy = RankedTensorType::get(memTy.getShape(),
                                             memTy.getElementType(), layout);
 
-      ScratchInfo info{ptr, tensorTy};
+      ScratchInfo info{ptr, tensorTy,
+                       baseInfo->hasScalePhysicalShadow && !scaleToPhysical,
+                       baseInfo->isScalePhysicalView || scaleToPhysical};
       return info;
     }
 
@@ -987,6 +1066,61 @@ Value expandAllSlicedDims(PatternRewriter &rewriter, Location loc,
     sliceEncoding = dyn_cast<ttg::SliceEncodingAttr>(type.getEncoding());
   }
   return tensor;
+}
+
+LogicalResult storeFpSanScaleScratchPhysical(PatternRewriter &rewriter,
+                                             Location loc, Value alloc,
+                                             Value tensor,
+                                             RankedTensorType tensorTy,
+                                             ttg::MemDescType scaleMemTy) {
+  if (tensorTy.getRank() != 2 ||
+      tensorTy.getElementType().getIntOrFloatBitWidth() != 8)
+    return failure();
+
+  if (!isa<ttg::DistributedEncodingTrait>(tensorTy.getEncoding()))
+    return failure();
+  if (!isa<ttng::TensorMemoryScalesEncodingAttr>(scaleMemTy.getEncoding()) ||
+      scaleMemTy.getShape() != tensorTy.getShape())
+    return failure();
+
+  auto shape = tensorTy.getShape();
+  int64_t rows = shape[0];
+  int64_t cols = shape[1];
+  if (rows % 32 != 0 || cols % 4 != 0)
+    return failure();
+  constexpr int64_t physicalRows = 128;
+  if (ttng::getTmemAllocSizes(scaleMemTy).numRows != physicalRows)
+    return failure();
+
+  Value stored = embedToInt(rewriter, loc, tensor);
+  // Form one 32-row physical tile, then store it at all four warp row offsets.
+  SmallVector<int64_t> chunkedShape = {rows / 32, 32, cols / 4, 4};
+  Value chunked = tt::ReshapeOp::create(rewriter, loc, chunkedShape, stored);
+  Value transposed = tt::TransOp::create(rewriter, loc, chunked, {1, 2, 0, 3});
+  SmallVector<int64_t> physicalShape = {32, rows * cols / 32};
+  Value physical =
+      tt::ReshapeOp::create(rewriter, loc, physicalShape, transposed);
+  auto physicalTy = cast<RankedTensorType>(physical.getType());
+
+  auto logicalOffset = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(product(shape)));
+  Value physicalBase = tt::AddPtrOp::create(rewriter, loc, alloc.getType(),
+                                            alloc, logicalOffset);
+  for (int64_t rowCopy = 0; rowCopy < physicalRows; rowCopy += 32) {
+    Value copyBase = physicalBase;
+    if (rowCopy != 0) {
+      auto copyOffset = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(rowCopy));
+      copyBase = tt::AddPtrOp::create(rewriter, loc, physicalBase.getType(),
+                                      physicalBase, copyOffset);
+    }
+    Value ptrs = createPointerTensorStrided2D(rewriter, loc, copyBase,
+                                              physicalTy, 1, physicalRows);
+    tt::StoreOp::create(rewriter, loc, ptrs, physical, Value(),
+                        CacheModifier::NONE, EvictionPolicy::NORMAL,
+                        /*ignore_cta=*/true);
+  }
+  return success();
 }
 
 Value createPointerTensorStrided2D(PatternRewriter &rewriter, Location loc,
@@ -2415,6 +2549,8 @@ struct TMEMStorePattern : public OpRewritePattern<ttng::TMEMStoreOp> {
     auto info = scratch->getOrCreate(op.getDst(), rewriter, scope);
     if (!info)
       return emitFpSanCodegenError(op.getOperation());
+    if (info->isScalePhysicalView)
+      return emitFpSanUnsupported(op.getOperation());
 
     auto loc = op.getLoc();
     auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
@@ -2431,6 +2567,12 @@ struct TMEMStorePattern : public OpRewritePattern<ttng::TMEMStoreOp> {
       stored = arith::SelectOp::create(rewriter, loc, pred, stored, previous);
     }
     if (!createStoreScratchMemory(rewriter, loc, info->ptr, stored, storageTy))
+      return emitFpSanCodegenError(op.getOperation());
+    auto dstTy = cast<ttg::MemDescType>(op.getDst().getType());
+    if (info->hasScalePhysicalShadow &&
+        isa<ttng::TensorMemoryScalesEncodingAttr>(dstTy.getEncoding()) &&
+        failed(storeFpSanScaleScratchPhysical(rewriter, loc, info->ptr, stored,
+                                              storageTy, dstTy)))
       return emitFpSanCodegenError(op.getOperation());
 
     createGlobalScratchBarrier(rewriter, loc,
@@ -2462,6 +2604,8 @@ struct TMEMCopyPattern : public OpRewritePattern<ttng::TMEMCopyOp> {
     auto info = scratch->getOrCreate(op.getDst(), rewriter, scope);
     if (!info)
       return emitFpSanCodegenError(op.getOperation());
+    if (info->isScalePhysicalView)
+      return emitFpSanUnsupported(op.getOperation());
 
     auto loc = op.getLoc();
     auto srcMemTy = cast<ttg::MemDescType>(op.getSrc().getType());
@@ -2478,6 +2622,11 @@ struct TMEMCopyPattern : public OpRewritePattern<ttng::TMEMCopyOp> {
         ttg::LocalLoadOp::create(rewriter, loc, srcRegTy, op.getSrc(), Value())
             .getResult();
     if (!storeFpSanScratchMemory(rewriter, loc, info->ptr, srcReg, srcRegTy))
+      return emitFpSanCodegenError(op.getOperation());
+    if (info->hasScalePhysicalShadow &&
+        isa<ttng::TensorMemoryScalesEncodingAttr>(dstMemTy.getEncoding()) &&
+        failed(storeFpSanScaleScratchPhysical(rewriter, loc, info->ptr, srcReg,
+                                              srcRegTy, dstMemTy)))
       return emitFpSanCodegenError(op.getOperation());
 
     createGlobalScratchBarrier(rewriter, loc,

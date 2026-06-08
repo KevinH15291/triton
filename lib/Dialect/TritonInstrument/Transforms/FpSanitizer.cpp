@@ -80,9 +80,8 @@ std::pair<int64_t, int64_t> getMmaEmulationTileShape(
   int64_t numWarps =
       ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
   if (supportsI8DotDecomposition(rewriter, accElem) && (k % kI8MmaK) == 0) {
-    if (!i8MmaTile)
-      i8MmaTile = {kI8MmaM * numWarps, 2 * kI8MmaN * numWarps};
-    auto [requestedM, requestedN] = *i8MmaTile;
+    auto [requestedM, requestedN] = i8MmaTile.value_or(
+        std::pair{kI8MmaM * numWarps, 2 * kI8MmaN * numWarps});
     int64_t tileM = std::min(requestedM, m);
     int64_t tileN = std::min(requestedN, n);
     if (canUseI8MmaTile(tileM, tileN, numWarps))
@@ -1548,12 +1547,10 @@ Value emitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
                            unsigned splitIdx) -> Value {
     if (splitIdx < fragmentSplits.size()) {
       auto [axis, stride] = fragmentSplits[splitIdx];
-      std::pair<Value, Value> aHalves{a, a};
-      std::pair<Value, Value> bHalves{b, b};
-      if (axis == 0)
-        aHalves = splitAtRegisterBasis(a, axis, stride);
-      else
-        bHalves = splitAtRegisterBasis(b, axis, stride);
+      auto aHalves =
+          axis == 0 ? splitAtRegisterBasis(a, axis, stride) : std::pair{a, a};
+      auto bHalves =
+          axis == 1 ? splitAtRegisterBasis(b, axis, stride) : std::pair{b, b};
       auto accHalves = splitAtRegisterBasis(accumulator, axis, stride);
       Value lhs = self(self, aHalves.first, bHalves.first, accHalves.first,
                        splitIdx + 1);
@@ -1562,9 +1559,9 @@ Value emitI8DotDecomposition(PatternRewriter &rewriter, Location loc,
       return joinAtRegisterBasis(lhs, rhs, axis, stride);
     }
 
-    auto tileShape = cast<RankedTensorType>(accumulator.getType()).getShape();
-    auto accMmaTy = RankedTensorType::get(tileShape, i32Ty, mmaLayout);
-    auto tileWorkTy = RankedTensorType::get(tileShape, workElem, mmaLayout);
+    auto tileWorkTy = cast<RankedTensorType>(accumulator.getType())
+                          .cloneWithEncoding(mmaLayout);
+    auto accMmaTy = tileWorkTy.clone(i32Ty);
     accumulator =
         ttg::ConvertLayoutOp::create(rewriter, loc, tileWorkTy, accumulator);
 
@@ -1665,7 +1662,6 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
       isScaleK32Aligned(scale.aScalePtr, scale.aScaleFactor) &&
       isScaleK32Aligned(scale.bScalePtr, scale.bScaleFactor) &&
       canUseI8MmaTile(tileM, tileN, numWarps);
-  auto dTileTy = accTileTy;
   ttg::NvidiaMmaEncodingAttr mmaLayout;
   if (canUseI8Decomposition) {
     auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA(accTileTy.getShape(), numWarps);
@@ -1673,10 +1669,10 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
         rewriter.getContext(), /*versionMajor=*/2, /*versionMinor=*/0,
         warpsPerCTA, ttg::getCGALayout(accLayout),
         SmallVector<unsigned>{kI8MmaM, kI8MmaN});
-    dTileTy = accTileTy.cloneWithEncoding(mmaLayout);
+    accTileTy = accTileTy.cloneWithEncoding(mmaLayout);
   }
-  auto accTileITy = getScratchStorageType(dTileTy);
-  Value accTile = loadScratchStrided2D(rewriter, loc, dTilePtr, dTileTy,
+  auto accTileITy = getScratchStorageType(accTileTy);
+  Value accTile = loadScratchStrided2D(rewriter, loc, dTilePtr, accTileTy,
                                        dRowStride, dStride);
   Value accTileI = embedToInt(rewriter, loc, accTile);
   if (canUseI8Decomposition) {
@@ -1782,11 +1778,11 @@ std::optional<scf::ForOp> emitMmaEmulationLoops(
   Value accMasked = arith::MulIOp::create(rewriter, loc, accTileI, predInv);
   Value outSelI = arith::AddIOp::create(rewriter, loc, outMasked, accMasked);
   outSelI = castSignedIntValueToType(rewriter, loc, outSelI, accTileITy);
-  Value out = isFloatLike(dTileTy)
-                  ? unembedToFloat(rewriter, loc, outSelI, dTileTy)
+  Value out = isFloatLike(accTileTy)
+                  ? unembedToFloat(rewriter, loc, outSelI, accTileTy)
                   : outSelI;
   createGlobalScratchBarrier(rewriter, loc);
-  storeScratchStrided2D(rewriter, loc, dTilePtr, out, dTileTy, dRowStride,
+  storeScratchStrided2D(rewriter, loc, dTilePtr, out, accTileTy, dRowStride,
                         dStride);
   return mLoop;
 }

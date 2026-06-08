@@ -158,7 +158,8 @@ std::pair<int64_t, int64_t> getMmaEmulationTileShape(
 
   constexpr int kMmaTemporaryRegisters = 16;
   constexpr int kDedicatedMmaRegisters = 32;
-  constexpr int kMaxMmaTileRegisters = 80;
+  constexpr int kMaxMmaTileRegisters =
+      kDedicatedMmaRegisters + kMmaTemporaryRegisters;
   int64_t legacyM = std::min<int64_t>(kI8MmaM * numWarps, m);
   int64_t legacyN = std::min<int64_t>(2 * kI8MmaN * numWarps, n);
   if (canUseI8MmaTile(legacyM, legacyN, numWarps))

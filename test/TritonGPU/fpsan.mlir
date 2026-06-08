@@ -31,7 +31,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.maxnreg = 24 : i32} {
   // CHECK-LABEL: @dot_i8_tile_maxnreg_24
   tt.func public @dot_i8_tile_maxnreg_24() -> tensor<64x64xf32, #blocked> {
-    // CHECK: tensor<16x16x!tt.ptr<i32>
+    // CHECK: tensor<32x32x!tt.ptr<i32>
     %one = arith.constant 1.000000e+00 : f8E4M3FN
     %zero = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked>
     %a = tt.splat %one : f8E4M3FN -> tensor<64x32xf8E4M3FN, #dot_operand_a>
@@ -85,7 +85,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 16 : i32, ttg.maxnreg = 64 : i32} {
   // CHECK-LABEL: @dot_i8_tile_maxnreg_64_total_warps_16
   tt.func public @dot_i8_tile_maxnreg_64_total_warps_16() -> tensor<64x64xf32, #blocked> {
-    // CHECK: tensor<16x16x!tt.ptr<i32>
+    // CHECK: tensor<32x32x!tt.ptr<i32>
     %one = arith.constant 1.000000e+00 : f8E4M3FN
     %zero = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked>
     %a = tt.splat %one : f8E4M3FN -> tensor<64x32xf8E4M3FN, #dot_operand_a>

@@ -71,22 +71,15 @@ bool canUseI8MmaTile(int64_t m, int64_t n, int numWarps) {
          (m / kI8MmaM) * (n / kI8MmaN) >= numWarps;
 }
 
-std::pair<int64_t, int64_t> getMmaEmulationTileShape(
-    PatternRewriter &rewriter, int64_t m, int64_t n, int64_t k,
-    IntegerType accElem, bool directShared = false,
-    std::optional<std::pair<int64_t, int64_t>> i8MmaTile = std::nullopt) {
+std::pair<int64_t, int64_t>
+getMmaEmulationTileShape(PatternRewriter &rewriter, int64_t m, int64_t n,
+                         int64_t k, IntegerType accElem,
+                         bool directShared = false) {
   std::pair<int64_t, int64_t> tile = {std::min<int64_t>(kTileM, m),
                                       std::min<int64_t>(kTileN, n)};
   int64_t numWarps =
       ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
   if (supportsI8DotDecomposition(rewriter, accElem) && (k % kI8MmaK) == 0) {
-    if (i8MmaTile && numWarps == 1 && accElem.getWidth() <= 32) {
-      auto [tileM, tileN] = *i8MmaTile;
-      if (tileM > 0 && tileN > 0 && (m % tileM) == 0 && (n % tileN) == 0 &&
-          canUseI8MmaTile(tileM, tileN, numWarps))
-        return *i8MmaTile;
-    }
-
     int64_t tileM = std::min<int64_t>(kI8MmaM * numWarps, m);
     int64_t tileN = std::min<int64_t>(kI8MmaN * numWarps, n);
     if (canUseI8MmaTile(tileM, tileN, numWarps))
@@ -2621,12 +2614,8 @@ struct TCGen5MMAPattern : public OpRewritePattern<ttng::TCGen5MMAOp> {
         arith::ExtUIOp::create(rewriter, loc, accElem, op.getPred());
 
     rewriter.setInsertionPoint(op);
-    bool directShared = !aIsTmem || !bIsTmem;
-    std::optional<std::pair<int64_t, int64_t>> preferredI8MmaTile;
-    if (directShared)
-      preferredI8MmaTile = std::pair<int64_t, int64_t>{32, 32};
     auto [tileM, tileN] = getMmaEmulationTileShape(
-        rewriter, m, n, k, accElem, directShared, preferredI8MmaTile);
+        rewriter, m, n, k, accElem, /*directShared=*/!aIsTmem || !bIsTmem);
     auto accTileLayout =
         getOptimizedBlockedEncoding(rewriter, {tileM, tileN}, accElem);
     auto accTileTy =
@@ -2789,18 +2778,8 @@ struct TCGen5MMAScaledPattern
     if (!bScaleScratch)
       return emitFpSanCodegenError(op.getOperation());
 
-    bool directShared = !aIsTmem || !bIsTmem;
-    auto isScaleK32Aligned = [](int64_t scaleFactor) {
-      return scaleFactor > 0 &&
-             ((kI8MmaK % scaleFactor) == 0 || (scaleFactor % kI8MmaK) == 0);
-    };
-    bool usePreferredTile = directShared && isScaleK32Aligned(*aScaleFactor) &&
-                            isScaleK32Aligned(*bScaleFactor);
-    std::optional<std::pair<int64_t, int64_t>> preferredI8MmaTile;
-    if (usePreferredTile)
-      preferredI8MmaTile = std::pair<int64_t, int64_t>{32, 32};
     auto [tileM, tileN] = getMmaEmulationTileShape(
-        rewriter, m, n, k, accElem, directShared, preferredI8MmaTile);
+        rewriter, m, n, k, accElem, /*directShared=*/!aIsTmem || !bIsTmem);
 
     auto accTileLayout = getOptimizedBlockedEncoding(rewriter, {tileM, tileN},
                                                      dMemTy.getElementType());

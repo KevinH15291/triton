@@ -2511,10 +2511,9 @@ def test_tmem_copy_scales_in_warp_specialize_partition(device, scale_shape, two_
         tcgen05_commit(bar)
 
     @gluon.jit
-    def load_partition(tmem, bar, out_ptr, PHYSICAL_LAYOUT: gl.constexpr):
+    def load_partition(physical, bar, out_ptr):
         mbarrier.wait(bar, phase=0)
         mbarrier.invalidate(bar)
-        physical = tmem._reinterpret(shape=(TMEM_ROWS, TMEM_COLS), layout=PHYSICAL_LAYOUT)
         physical_reg_layout: gl.constexpr = physical.get_reg_layout()
         copied = physical.load(physical_reg_layout)
         out_ptrs = out_ptr + gl.arange(0, TMEM_ROWS)[:, None] * TMEM_COLS + gl.arange(0, TMEM_COLS)[None, :]
@@ -2581,12 +2580,13 @@ def test_tmem_copy_scales_in_warp_specialize_partition(device, scale_shape, two_
         bar = mbarrier.allocate_mbarrier()
         mbarrier.init(bar, count=1)
         physical_layout: gl.constexpr = TensorMemoryLayout((TMEM_ROWS, TMEM_COLS), col_stride=1, cga_layout=cga_layout)
+        physical = tmem._reinterpret(shape=(TMEM_ROWS, TMEM_COLS), layout=physical_layout)
 
         gl.warp_specialize(
             [
                 (default_partition, ()),
                 (copy_partition, (smem, tmem, bar)),
-                (load_partition, (tmem, bar, out_ptr, physical_layout)),
+                (load_partition, (physical, bar, out_ptr)),
             ],
             [1, 4],
             [32, 32],

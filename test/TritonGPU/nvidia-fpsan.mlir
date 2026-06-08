@@ -396,27 +396,35 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
   // CHECK-LABEL: @tmem_copy_commit_two_ctas
   tt.func public @tmem_copy_commit_two_ctas() -> tensor<128x128xi8, #blocked_copy> {
-    // CHECK: ttg.global_scratch_alloc {{.*}}nbytes = 20480{{.*}}shared_cluster_state
+    // CHECK: ttg.global_scratch_alloc {{.*}}nbytes = 4096{{.*}}shared_cluster_state
     // CHECK-NOT: ttng.tmem_copy
     // CHECK: ttng.cluster_barrier
     // CHECK-NEXT: {{.*}} = ttg.local_load
-    // CHECK-COUNT-5: tt.store
-    // CHECK-NOT: tt.store
+    // CHECK: tt.store
     // CHECK: ttg.barrier global_read|global_write
     // CHECK-NEXT: ttng.cluster_barrier
     // CHECK: ttg.barrier global_read|global_write
     // CHECK-NEXT: ttng.cluster_barrier
     // CHECK: ttng.arrive_barrier
     // CHECK: tt.load
+    // CHECK: tt.reshape
+    // CHECK: tt.trans
+    // CHECK: tt.reshape
+    // CHECK: tt.reshape
+    // CHECK: tt.broadcast
+    // CHECK: tt.reshape
+    // CHECK: ttg.convert_layout
     // CHECK-NOT: ttng.tmem_load
     // CHECK-NOT: ttng.tc_gen5_commit
+    // CHECK-NOT: ttg.global_scratch_alloc
+    // CHECK-NOT: tt.store
     %true = arith.constant true
     %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x32xi8, #shared_copy, #smem, mutable>
     %dst = ttng.tmem_alloc : () -> !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     %bar = ttg.local_alloc {allocation.offset = 8192 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %alias = ttg.memdesc_reinterpret %dst : !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xi8, #tmem_copy_alias, #ttng.tensor_memory, mutable>
     ttng.tmem_copy %src, %dst : !ttg.memdesc<128x32xi8, #shared_copy, #smem, mutable>, !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     ttng.tc_gen5_commit %bar, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    %alias = ttg.memdesc_reinterpret %dst : !ttg.memdesc<128x32xi8, #tmem_scales, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xi8, #tmem_copy_alias, #ttng.tensor_memory, mutable>
     %val = ttng.tmem_load %alias : !ttg.memdesc<128x128xi8, #tmem_copy_alias, #ttng.tensor_memory, mutable> -> tensor<128x128xi8, #blocked_copy>
     tt.return %val : tensor<128x128xi8, #blocked_copy>
   }

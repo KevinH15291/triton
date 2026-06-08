@@ -71,6 +71,41 @@ bool canUseI8MmaTile(int64_t m, int64_t n, int numWarps) {
          (m / kI8MmaM) * (n / kI8MmaN) >= numWarps;
 }
 
+std::pair<int64_t, int64_t> getMmaEmulationTileShape(
+    PatternRewriter &rewriter, int64_t m, int64_t n, int64_t k,
+    IntegerType accElem,
+    std::optional<std::pair<int64_t, int64_t>> i8MmaTile = std::nullopt) {
+  std::pair<int64_t, int64_t> tile = {std::min<int64_t>(kTileM, m),
+                                      std::min<int64_t>(kTileN, n)};
+  int64_t numWarps =
+      ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
+  if (!supportsI8DotDecomposition(rewriter, accElem) || (k % kI8MmaK) != 0)
+    return tile;
+
+  if (i8MmaTile) {
+    auto requested = std::pair{std::min(i8MmaTile->first, m),
+                               std::min(i8MmaTile->second, n)};
+    return canUseI8MmaTile(requested.first, requested.second, numWarps)
+               ? requested
+               : tile;
+  }
+
+  // Cap the MMAv2 accumulator at 32 registers per thread.
+  int64_t maxTileArea = 32 * 32 * numWarps / (accElem.getWidth() == 64 ? 2 : 1);
+  for (int64_t tileM = kI8MmaM; tileM <= m; tileM *= 2) {
+    if ((m % tileM) != 0)
+      continue;
+    for (int64_t tileN = kI8MmaN; tileN <= n; tileN *= 2) {
+      if ((n % tileN) == 0 && tileM <= 2 * tileN && tileN <= 2 * tileM &&
+          canUseI8MmaTile(tileM, tileN, numWarps) &&
+          tileM * tileN <= maxTileArea &&
+          tileM * tileN > tile.first * tile.second)
+        tile = {tileM, tileN};
+    }
+  }
+  return tile;
+}
+
 Operation *createGlobalScratchBarrier(PatternRewriter &rewriter, Location loc,
                                       bool sharedClusterState = false) {
   Operation *barrier = ttg::BarrierOp::create(rewriter, loc,
@@ -133,47 +168,6 @@ ttg::BlockedEncodingAttr getOptimizedBlockedEncoding(PatternRewriter &rewriter,
   return ttg::BlockedEncodingAttr::get(
       rewriter.getContext(), sizePerThread, base.getThreadsPerWarp(),
       base.getWarpsPerCTA(), order, base.getCGALayout());
-}
-
-std::pair<int64_t, int64_t> getMmaEmulationTileShape(
-    PatternRewriter &rewriter, int64_t m, int64_t n, int64_t k,
-    IntegerType accElem,
-    std::optional<std::pair<int64_t, int64_t>> i8MmaTile = std::nullopt) {
-  std::pair<int64_t, int64_t> tile = {std::min<int64_t>(kTileM, m),
-                                      std::min<int64_t>(kTileN, n)};
-  int64_t numWarps =
-      ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
-  if (!supportsI8DotDecomposition(rewriter, accElem) || (k % kI8MmaK) != 0)
-    return tile;
-
-  if (i8MmaTile) {
-    auto [requestedM, requestedN] = *i8MmaTile;
-    int64_t tileM = std::min(requestedM, m);
-    int64_t tileN = std::min(requestedN, n);
-    if (canUseI8MmaTile(tileM, tileN, numWarps))
-      tile = {tileM, tileN};
-    return tile;
-  }
-
-  constexpr int kMaxAccumulatorRegisters = 32;
-  // MMAv2 distributes accumulator elements over 32 threads per warp.
-  int64_t maxTileArea = kMaxAccumulatorRegisters * 32 * numWarps /
-                        (accElem.getWidth() == 64 ? 2 : 1);
-
-  for (int64_t tileM = kI8MmaM; tileM <= m; tileM *= 2) {
-    if ((m % tileM) != 0)
-      continue;
-    for (int64_t tileN = kI8MmaN; tileN <= n; tileN *= 2) {
-      if ((n % tileN) != 0 || tileM > 2 * tileN || tileN > 2 * tileM ||
-          !canUseI8MmaTile(tileM, tileN, numWarps) ||
-          tileM * tileN > maxTileArea)
-        continue;
-
-      if (tileM * tileN > tile.first * tile.second)
-        tile = {tileM, tileN};
-    }
-  }
-  return tile;
 }
 
 struct ScratchInfo {

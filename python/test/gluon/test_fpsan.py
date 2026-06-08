@@ -8,7 +8,17 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton import language as tl
-from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_hopper, is_interpreter
+from triton._internal_testing import (
+    is_blackwell,
+    is_blackwell_ultra,
+    is_cuda,
+    is_hip,
+    is_hip_cdna3,
+    is_hip_cdna4,
+    is_hip_gfx1250,
+    is_hopper,
+    is_interpreter,
+)
 from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.experimental.gluon.language.nvidia.blackwell import (
@@ -2388,6 +2398,59 @@ def test_tmem_index_subslice(device, fresh_knobs):
     outw = triton.TensorWrapper(out, dtype=torch.float32)
 
     kernel[(1, )](xw, outw)
+
+    _assert_payload_equal(out, exp_bits)
+
+
+@pytest.mark.skipif(not is_blackwell_ultra(), reason="Requires Blackwell Ultra")
+@pytest.mark.parametrize("red_op,use_abs", [("min", False), ("max", True)])
+def test_tmem_load_reduce(device, red_op, use_abs, fresh_knobs):
+    _require_cuda_backend(device)
+
+    m = 128
+    n = 128
+    M = gl.constexpr(m)
+    N = gl.constexpr(n)
+
+    fresh_knobs.compilation.instrumentation_mode = "fpsan"
+
+    @gluon.jit
+    def kernel(x_ptr, out_ptr, RED_OP: gl.constexpr, USE_ABS: gl.constexpr):
+        layout: gl.constexpr = gl.BlockedLayout([1, 1], [32, 1], [gl.num_warps(), 1], [1, 0])
+        red_layout: gl.constexpr = gl.SliceLayout(1, layout)
+        offs_m = gl.arange(0, M, layout=red_layout)
+        offs_n = gl.arange(0, N, layout=gl.SliceLayout(0, layout))
+        offs = offs_m[:, None] * N + offs_n[None, :]
+
+        value = gl.load(x_ptr + offs)
+        tmem_layout: gl.constexpr = TensorMemoryLayout((M, N), col_stride=1)
+        tmem = allocate_tensor_memory(gl.float32, [M, N], layout=tmem_layout)
+        tmem.store(gl.convert_layout(value, tmem.get_reg_layout()))
+
+        if RED_OP == "min":
+            _, reduced = tmem.load_min(abs=USE_ABS)
+        else:
+            _, reduced = tmem.load_max(abs=USE_ABS)
+        gl.store(out_ptr + offs_m, gl.convert_layout(reduced, red_layout))
+
+    rs = np.random.RandomState(0)
+    x_bits = rs.uniform(-100.0, 100.0, size=(m, n)).astype(np.float32).view(np.int32)
+    reduction_bits = x_bits
+    if use_abs:
+        reduction_bits = _u32_to_i32(_as_u32(x_bits) & np.uint32(0x7FFFFFFF))
+    payload = _u32_to_i32(_mix_f32_bits_to_payload_u32(reduction_bits))
+    reduced_payload = (payload.min(axis=1) if red_op == "min" else payload.max(axis=1)).astype(np.int32)
+    exp_bits = _unmix_payload_u32_to_f32_bits_i32(reduced_payload.view(np.uint32))
+
+    x = torch.tensor(x_bits, device=device, dtype=torch.int32)
+    out = torch.empty((m, ), device=device, dtype=torch.int32)
+    kernel[(1, )](
+        triton.TensorWrapper(x, dtype=torch.float32),
+        triton.TensorWrapper(out, dtype=torch.float32),
+        RED_OP=red_op,
+        USE_ABS=use_abs,
+        num_warps=4,
+    )
 
     _assert_payload_equal(out, exp_bits)
 

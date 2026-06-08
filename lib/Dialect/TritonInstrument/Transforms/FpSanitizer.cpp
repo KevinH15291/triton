@@ -2355,18 +2355,49 @@ struct TMEMLoadPattern : public OpRewritePattern<ttng::TMEMLoadOp> {
     if (!result)
       return emitFpSanCodegenError(op.getOperation());
 
+    Value reduced;
+    if (op.getRed()) {
+      Value reductionInput = result;
+      if (op.getAbs().value_or(false))
+        reductionInput =
+            math::AbsFOp::create(rewriter, loc, reductionInput).getResult();
+      reductionInput = embedToInt(rewriter, loc, reductionInput);
+
+      auto reduce =
+          tt::ReduceOp::create(rewriter, loc, ValueRange{reductionInput}, 1);
+      Block &block = reduce.getCombineOp().emplaceBlock();
+      Type elemTy = getElementTypeOrSelf(reductionInput.getType());
+      block.addArguments({elemTy, elemTy}, {loc, loc});
+
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(&block);
+        Value lhs = block.getArgument(0);
+        Value rhs = block.getArgument(1);
+        // FPSAN gives both NaN modes the same signed-payload semantics.
+        Value combined =
+            *op.getRedOp() == ttng::TMEMLoadReduceModifier::MIN
+                ? arith::MinSIOp::create(rewriter, loc, lhs, rhs).getResult()
+                : arith::MaxSIOp::create(rewriter, loc, lhs, rhs).getResult();
+        tt::ReduceReturnOp::create(rewriter, loc, ValueRange{combined});
+      }
+      reduced = unembedToFloat(rewriter, loc, reduce.getResult().front(),
+                               op.getRed().getType());
+    }
+
     createGlobalScratchBarrier(rewriter, loc,
                                scratch->usesSharedClusterState());
 
-    if (op.getNumResults() == 1) {
-      rewriter.replaceOp(op, result);
-      return success();
+    SmallVector<Value> replacements{result};
+    if (op.getToken()) {
+      SmallVector<Value> deps;
+      if (op.getDep())
+        deps.push_back(op.getDep());
+      replacements.push_back(createAsyncToken(rewriter, loc, deps));
     }
-    SmallVector<Value> deps;
-    if (op.getDep())
-      deps.push_back(op.getDep());
-    Value token = createAsyncToken(rewriter, loc, deps);
-    rewriter.replaceOp(op, {result, token});
+    if (reduced)
+      replacements.push_back(reduced);
+    rewriter.replaceOp(op, replacements);
     return success();
   }
 
@@ -2389,7 +2420,17 @@ struct TMEMStorePattern : public OpRewritePattern<ttng::TMEMStoreOp> {
     auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
     if (!srcTy.getEncoding())
       return emitFpSanUnsupported(op.getOperation());
-    if (!storeFpSanScratchMemory(rewriter, loc, info->ptr, op.getSrc(), srcTy))
+    auto storageTy = getScratchStorageType(srcTy);
+    Value stored = embedToInt(rewriter, loc, op.getSrc());
+    if (!matchPattern(op.getPred(), m_One())) {
+      Value previous =
+          createLoadScratchMemory(rewriter, loc, info->ptr, storageTy);
+      auto predTy = storageTy.clone(rewriter.getI1Type());
+      Value pred =
+          tt::SplatOp::create(rewriter, loc, predTy, op.getPred()).getResult();
+      stored = arith::SelectOp::create(rewriter, loc, pred, stored, previous);
+    }
+    if (!createStoreScratchMemory(rewriter, loc, info->ptr, stored, storageTy))
       return emitFpSanCodegenError(op.getOperation());
 
     createGlobalScratchBarrier(rewriter, loc,

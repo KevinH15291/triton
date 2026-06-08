@@ -338,8 +338,7 @@ public:
         auto initTy = cast<RankedTensorType>(init.getType());
         if (!storeFpSanScratchMemory(rewriter, loc, ptr, init, initTy))
           return std::nullopt;
-        if (sharedClusterState)
-          createGlobalScratchBarrier(rewriter, loc, sharedClusterState);
+        createGlobalScratchBarrier(rewriter, loc, sharedClusterState);
       }
 
       state.canonical = ScratchInfo{ptr, tensorTy};

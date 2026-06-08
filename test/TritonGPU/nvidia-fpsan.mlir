@@ -4,6 +4,8 @@
 //--- success.mlir
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#blocked_reduce = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#red = #ttg.slice<{dim = 1, parent = #blocked_reduce}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.tensor_memory_size = 0 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @tmem_load_store
@@ -21,13 +23,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     ttng.tmem_store %val, %buf, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
-}
 
-// -----
-
-#blocked = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.tensor_memory_size = 0 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @tmem_store_predicate(
   // CHECK-SAME: %[[PRED_ARG:.*]]: i1
   tt.func public @tmem_store_predicate(%pred: i1) {
@@ -42,14 +38,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     ttng.tmem_store %one, %buf, %pred : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
-}
 
-// -----
-
-#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
-#red = #ttg.slice<{dim = 1, parent = #blocked}>
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.tensor_memory_size = 0 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @tmem_load_reduce
   tt.func public @tmem_load_reduce() -> tensor<128xf32, #red> {
     // CHECK: %[[LOADED:.*]] = tt.load
@@ -62,9 +51,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     // CHECK: %[[RED_VALUE:.*]] = tti.experimental_fpsan_unembed %[[REDUCED]]
     // CHECK: tt.return %[[RED_VALUE]]
     // CHECK-NOT: ttng.tmem_load
-    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
-    %buf = ttng.tmem_alloc %zero {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    %result, %red = ttng.tmem_load %buf {redOp = #ttng.redOp<max>, abs = true, NaN = true} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>, tensor<128xf32, #red>
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked_reduce>
+    %buf = ttng.tmem_alloc %zero {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : (tensor<128x128xf32, #blocked_reduce>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %result, %red = ttng.tmem_load %buf {redOp = #ttng.redOp<max>, abs = true, NaN = true} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked_reduce>, tensor<128xf32, #red>
     tt.return %red : tensor<128xf32, #red>
   }
 }
@@ -407,12 +396,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     // CHECK-NEXT: ttng.cluster_barrier
     // CHECK: ttng.arrive_barrier
     // CHECK: tt.load
-    // CHECK: tt.reshape
     // CHECK: tt.trans
-    // CHECK: tt.reshape
-    // CHECK: tt.reshape
     // CHECK: tt.broadcast
-    // CHECK: tt.reshape
     // CHECK: ttg.convert_layout
     // CHECK-NOT: ttng.tmem_load
     // CHECK-NOT: ttng.tc_gen5_commit

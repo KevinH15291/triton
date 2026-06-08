@@ -8,17 +8,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton import language as tl
-from triton._internal_testing import (
-    is_blackwell,
-    is_blackwell_ultra,
-    is_cuda,
-    is_hip,
-    is_hip_cdna3,
-    is_hip_cdna4,
-    is_hip_gfx1250,
-    is_hopper,
-    is_interpreter,
-)
+from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_hopper, is_interpreter
+from triton._internal_testing import is_blackwell_ultra
 from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.experimental.gluon.language.nvidia.blackwell import (
@@ -2313,32 +2304,23 @@ def test_tcgen05_mma_scaled_two_ctas(device, fresh_knobs):
         scale_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_reg_layout))[:, None]
         a_scale_values = gl.load(a_scale_ptr + scale_offs_m * SCALE_K + a_scale_offs_k)
         b_scale_values = gl.load(b_scale_ptr + scale_offs_n * SCALE_K + b_scale_offs_k)
+        scale_smem_offset_bases: gl.constexpr = [
+            [0, 1],
+            [0, 2],
+            [32, 0],
+            [64, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+        ]
         a_scale_smem_layout: gl.constexpr = gl.SharedLinearLayout(
-            offset_bases=[
-                [0, 1],
-                [0, 2],
-                [32, 0],
-                [64, 0],
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-            ],
+            offset_bases=scale_smem_offset_bases,
             block_bases=((128, 0), ),
         )
         b_scale_smem_layout: gl.constexpr = gl.SharedLinearLayout(
-            offset_bases=[
-                [0, 1],
-                [0, 2],
-                [32, 0],
-                [64, 0],
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-            ],
+            offset_bases=scale_smem_offset_bases,
             block_bases=((0, 0), ),
         )
         a_scale_smem = gl.allocate_shared_memory(gl.int8, [BLOCK_M, SCALE_K], a_scale_smem_layout)

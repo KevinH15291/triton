@@ -327,6 +327,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttgpuir.add_allocate_warp_groups(pm, "consan" in opt.instrumentation_mode)
         if "fpsan" in opt.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm)
@@ -352,6 +353,7 @@ class CUDABackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
+        passes.ttgpuir.add_allocate_warp_groups(pm, "consan" in options.instrumentation_mode)
         if "fpsan" in options.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
         if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
@@ -376,7 +378,6 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-        passes.ttgpuir.add_allocate_warp_groups(pm, "consan" in options.instrumentation_mode)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         if "consan" in options.instrumentation_mode:

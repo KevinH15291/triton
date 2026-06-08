@@ -73,17 +73,15 @@ bool canUseI8MmaTile(int64_t m, int64_t n, int numWarps) {
 
 std::pair<int64_t, int64_t> getMmaEmulationTileShape(
     PatternRewriter &rewriter, int64_t m, int64_t n, int64_t k,
-    IntegerType accElem, bool directShared = false,
+    IntegerType accElem,
     std::optional<std::pair<int64_t, int64_t>> i8MmaTile = std::nullopt) {
   std::pair<int64_t, int64_t> tile = {std::min<int64_t>(kTileM, m),
                                       std::min<int64_t>(kTileN, n)};
   int64_t numWarps =
       ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
   if (supportsI8DotDecomposition(rewriter, accElem) && (k % kI8MmaK) == 0) {
-    if (!i8MmaTile) {
-      int64_t tileN = directShared ? 2 * kI8MmaN : kI8MmaN;
-      i8MmaTile = {kI8MmaM * numWarps, tileN * numWarps};
-    }
+    if (!i8MmaTile)
+      i8MmaTile = {kI8MmaM * numWarps, 2 * kI8MmaN * numWarps};
     auto [requestedM, requestedN] = *i8MmaTile;
     int64_t tileM = std::min(requestedM, m);
     int64_t tileN = std::min(requestedN, n);
@@ -2614,8 +2612,7 @@ struct TCGen5MMAPattern : public OpRewritePattern<ttng::TCGen5MMAOp> {
         arith::ExtUIOp::create(rewriter, loc, accElem, op.getPred());
 
     rewriter.setInsertionPoint(op);
-    auto [tileM, tileN] = getMmaEmulationTileShape(
-        rewriter, m, n, k, accElem, /*directShared=*/!aIsTmem || !bIsTmem);
+    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
     auto accTileLayout =
         getOptimizedBlockedEncoding(rewriter, {tileM, tileN}, accElem);
     auto accTileTy =
@@ -2778,8 +2775,7 @@ struct TCGen5MMAScaledPattern
     if (!bScaleScratch)
       return emitFpSanCodegenError(op.getOperation());
 
-    auto [tileM, tileN] = getMmaEmulationTileShape(
-        rewriter, m, n, k, accElem, /*directShared=*/!aIsTmem || !bIsTmem);
+    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
 
     auto accTileLayout = getOptimizedBlockedEncoding(rewriter, {tileM, tileN},
                                                      dMemTy.getElementType());

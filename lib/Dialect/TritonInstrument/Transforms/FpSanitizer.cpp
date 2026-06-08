@@ -10,6 +10,7 @@
 #include "triton/Dialect/TritonInstrument/IR/Utility.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -69,25 +70,6 @@ bool supportsI8DotDecomposition(PatternRewriter &rewriter,
 bool canUseI8MmaTile(int64_t m, int64_t n, int numWarps) {
   return m >= kI8MmaM && n >= kI8MmaN &&
          (m / kI8MmaM) * (n / kI8MmaN) >= numWarps;
-}
-
-std::pair<int64_t, int64_t> getMmaEmulationTileShape(
-    PatternRewriter &rewriter, int64_t m, int64_t n, int64_t k,
-    IntegerType accElem,
-    std::optional<std::pair<int64_t, int64_t>> i8MmaTile = std::nullopt) {
-  std::pair<int64_t, int64_t> tile = {std::min<int64_t>(kTileM, m),
-                                      std::min<int64_t>(kTileN, n)};
-  int64_t numWarps =
-      ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
-  if (supportsI8DotDecomposition(rewriter, accElem) && (k % kI8MmaK) == 0) {
-    auto [requestedM, requestedN] = i8MmaTile.value_or(
-        std::pair{kI8MmaM * numWarps, 2 * kI8MmaN * numWarps});
-    int64_t tileM = std::min(requestedM, m);
-    int64_t tileN = std::min(requestedN, n);
-    if (canUseI8MmaTile(tileM, tileN, numWarps))
-      tile = {tileM, tileN};
-  }
-  return tile;
 }
 
 Operation *createGlobalScratchBarrier(PatternRewriter &rewriter, Location loc,
@@ -152,6 +134,97 @@ ttg::BlockedEncodingAttr getOptimizedBlockedEncoding(PatternRewriter &rewriter,
   return ttg::BlockedEncodingAttr::get(
       rewriter.getContext(), sizePerThread, base.getThreadsPerWarp(),
       base.getWarpsPerCTA(), order, base.getCGALayout());
+}
+
+std::pair<int64_t, int64_t> getMmaEmulationTileShape(
+    PatternRewriter &rewriter, Operation *mmaOp, int64_t m, int64_t n,
+    int64_t k, IntegerType accElem,
+    std::optional<std::pair<int64_t, int64_t>> i8MmaTile = std::nullopt) {
+  std::pair<int64_t, int64_t> tile = {std::min<int64_t>(kTileM, m),
+                                      std::min<int64_t>(kTileN, n)};
+  int64_t numWarps =
+      ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
+  if (!supportsI8DotDecomposition(rewriter, accElem) || (k % kI8MmaK) != 0)
+    return tile;
+
+  if (i8MmaTile) {
+    auto [requestedM, requestedN] = *i8MmaTile;
+    int64_t tileM = std::min(requestedM, m);
+    int64_t tileN = std::min(requestedN, n);
+    if (canUseI8MmaTile(tileM, tileN, numWarps))
+      tile = {tileM, tileN};
+    return tile;
+  }
+
+  constexpr int kMmaTemporaryRegisters = 16;
+  constexpr int kDedicatedMmaRegisters = 32;
+  constexpr int kMaxMmaTileRegisters = 80;
+  int64_t legacyM = std::min<int64_t>(kI8MmaM * numWarps, m);
+  int64_t legacyN = std::min<int64_t>(2 * kI8MmaN * numWarps, n);
+  if (canUseI8MmaTile(legacyM, legacyN, numWarps))
+    tile = {legacyM, legacyN};
+
+  int maxRegisters = ttng::getContextualMaxNReg(mmaOp);
+  auto moduleOp = mmaOp->getParentOfType<ModuleOp>();
+  int totalWarps = numWarps;
+  if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
+    totalWarps = attr.getInt();
+  // Low-register MMA partitions are typically dedicated to the emulation.
+  // Preserve 32 registers in small kernels, then bias progressively toward
+  // surrounding live values once the kernel grows beyond eight warps.
+  int excessWarps =
+      maxRegisters > kDedicatedMmaRegisters ? std::max(0, totalWarps - 8) : 0;
+  int minimumCoreRegisters = std::max(kMmaTemporaryRegisters,
+                                      kDedicatedMmaRegisters - 2 * excessWarps);
+  int surroundingRegisterReserve =
+      std::min(2 * kMmaTemporaryRegisters, 4 * excessWarps);
+  int contextualRegisterBudget =
+      maxRegisters -
+      std::min(kMmaTemporaryRegisters + surroundingRegisterReserve,
+               std::max(0, maxRegisters - minimumCoreRegisters));
+  // Leave allocator headroom when the surrounding kernel is register-heavy.
+  if (surroundingRegisterReserve > 0)
+    --contextualRegisterBudget;
+  int tileRegisterBudget =
+      std::min(kMaxMmaTileRegisters, contextualRegisterBudget);
+  IntegerType workElem =
+      accElem.getWidth() == 64 ? accElem : rewriter.getI32Type();
+
+  int64_t bestArea = 0;
+  for (int64_t tileM = kI8MmaM; tileM <= m; tileM *= 2) {
+    if ((m % tileM) != 0)
+      continue;
+    for (int64_t tileN = kI8MmaN; tileN <= n; tileN *= 2) {
+      if ((n % tileN) != 0 || tileM > 2 * tileN || tileN > 2 * tileM ||
+          !canUseI8MmaTile(tileM, tileN, numWarps))
+        continue;
+
+      auto blockedLayout =
+          getOptimizedBlockedEncoding(rewriter, {tileM, tileN}, workElem);
+      auto warpsPerCTA = ttg::getMmaV2WarpsPerCTA({tileM, tileN}, numWarps);
+      auto mmaLayout = ttg::NvidiaMmaEncodingAttr::get(
+          rewriter.getContext(), /*versionMajor=*/2, /*versionMinor=*/0,
+          warpsPerCTA, blockedLayout.getCGALayout(),
+          SmallVector<unsigned>{kI8MmaM, kI8MmaN});
+      auto tileTy = RankedTensorType::get({tileM, tileN}, workElem, mmaLayout);
+      int accumulatorRegisters = ttg::getTotalElemsPerThread(tileTy) *
+                                 workElem.getIntOrFloatBitWidth() / 32;
+      int coreRegisters = accumulatorRegisters + kMmaTemporaryRegisters;
+      if (coreRegisters > tileRegisterBudget)
+        continue;
+
+      int64_t area = tileM * tileN;
+      int64_t imbalance = std::abs(tileM - tileN);
+      int64_t bestImbalance = std::abs(tile.first - tile.second);
+      if (area > bestArea || (area == bestArea && imbalance < bestImbalance) ||
+          (area == bestArea && imbalance == bestImbalance &&
+           tileN > tile.second)) {
+        tile = {tileM, tileN};
+        bestArea = area;
+      }
+    }
+  }
+  return tile;
 }
 
 struct ScratchInfo {
@@ -2100,7 +2173,8 @@ struct DotPattern : public OpRewritePattern<tt::DotOp> {
     Value predInt = arith::ConstantOp::create(
         rewriter, loc, rewriter.getIntegerAttr(accElem, 1));
 
-    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
+    auto [tileM, tileN] =
+        getMmaEmulationTileShape(rewriter, op.getOperation(), m, n, k, accElem);
 
     // Use optimized blocked layouts for emulation tiles instead of the
     // original dot encodings.  Encodings like AMDWmmaEncodingAttr impose
@@ -2253,7 +2327,8 @@ struct DotScaledPattern : public OpRewritePattern<tt::DotScaledOp> {
     Value predInt = arith::ConstantOp::create(
         rewriter, loc, rewriter.getIntegerAttr(accElem, 1));
 
-    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
+    auto [tileM, tileN] =
+        getMmaEmulationTileShape(rewriter, op.getOperation(), m, n, k, accElem);
 
     auto accLayout = getOptimizedBlockedEncoding(rewriter, {tileM, tileN},
                                                  cTy.getElementType());
@@ -2522,7 +2597,8 @@ struct WarpGroupDotPattern : public OpRewritePattern<ttng::WarpGroupDotOp> {
     if (!aScratch || !bScratch || !dPtr)
       return emitFpSanCodegenError(op.getOperation());
 
-    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
+    auto [tileM, tileN] =
+        getMmaEmulationTileShape(rewriter, op.getOperation(), m, n, k, accElem);
 
     auto accTileLayout = getOptimizedBlockedEncoding(rewriter, {tileM, tileN},
                                                      cTy.getElementType());
@@ -2608,7 +2684,8 @@ struct TCGen5MMAPattern : public OpRewritePattern<ttng::TCGen5MMAOp> {
         arith::ExtUIOp::create(rewriter, loc, accElem, op.getPred());
 
     rewriter.setInsertionPoint(op);
-    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
+    auto [tileM, tileN] =
+        getMmaEmulationTileShape(rewriter, op.getOperation(), m, n, k, accElem);
     auto accTileLayout =
         getOptimizedBlockedEncoding(rewriter, {tileM, tileN}, accElem);
     auto accTileTy =
@@ -2771,7 +2848,8 @@ struct TCGen5MMAScaledPattern
     if (!bScaleScratch)
       return emitFpSanCodegenError(op.getOperation());
 
-    auto [tileM, tileN] = getMmaEmulationTileShape(rewriter, m, n, k, accElem);
+    auto [tileM, tileN] =
+        getMmaEmulationTileShape(rewriter, op.getOperation(), m, n, k, accElem);
 
     auto accTileLayout = getOptimizedBlockedEncoding(rewriter, {tileM, tileN},
                                                      dMemTy.getElementType());

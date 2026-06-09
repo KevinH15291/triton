@@ -212,8 +212,7 @@ struct ConvertTritonGPUToLLVM
                                                         benefit);
     mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter, patterns,
                                                         targetInfo);
-    mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns,
-                                              targetInfo);
+    mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns);
     mlir::triton::populateGSanToLLVMPatterns(typeConverter, patterns,
                                              axisInfoAnalysis, targetInfo);
 

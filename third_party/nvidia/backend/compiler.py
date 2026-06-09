@@ -472,14 +472,6 @@ class CUDABackend(BaseBackend):
         flags = ["nvptx-mad-wide-opt"]
         canonicalize_gep = "fpsan" in opt.instrumentation_mode
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
-        if "fpsan" in opt.instrumentation_mode:
-            # NVPTX lowers fabs to a floating-point abs that quiets NaNs, corrupting FPSan payloads.
-            ret = re.sub(
-                r"^([ \t]*)abs\.f32[ \t]+([^,\s]+),[ \t]*([^;\s]+);",
-                r"\1copysign.f32 \2, 0f00000000, \3;",
-                ret,
-                flags=re.MULTILINE,
-            )
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1

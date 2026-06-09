@@ -1,6 +1,8 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "third_party/nvidia/include/TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "llvm/ADT/APFloat.h"
@@ -118,12 +120,26 @@ Value inverseXorShiftRight(ConversionPatternRewriter &rewriter, Location loc,
 }
 
 Value mixFloatToInt(ConversionPatternRewriter &rewriter, Location loc, Value u,
-                    FloatType floatTy) {
+                    FloatType floatTy, const TargetInfoBase &targetInfo) {
   TritonLLVMOpBuilder b(loc, rewriter);
   PayloadMixConfig cfg = getPayloadMixConfig(floatTy);
   Value signFlip =
       selectUIntConstantOnSign(rewriter, loc, u, cfg.signMask, 0, cfg.signMask);
-  Value x = b.xor_(u, signFlip);
+  Value x;
+  if (targetInfo.isCuda() && cfg.bitWidth == 32) {
+    // Keep LLVM from folding this sign clear to fabs, which quiets NaN payloads
+    // when lowered through NVPTX.
+    PTXBuilder ptx;
+    auto *dst = ptx.newOperand("=r");
+    auto *src = ptx.newOperand(u, "r");
+    auto *mask = ptx.newConstantOperand("0x7fffffff");
+    auto &clearSign = *ptx.create("and");
+    clearSign.o("b32");
+    clearSign(dst, src, mask);
+    x = ptx.launch(rewriter, loc, u.getType(), /*hasSideEffect=*/false);
+  } else {
+    x = b.xor_(u, signFlip);
+  }
   Value mulA = createUIntConstant(rewriter, loc, u.getType(), cfg.mulA);
   Value magMask = createUIntConstant(rewriter, loc, u.getType(), cfg.magMask);
   Value yMul = b.mul(x, mulA);
@@ -165,7 +181,10 @@ Value bitcastIfNeeded(ConversionPatternRewriter &rewriter, Location loc,
 
 struct ExperimentalFPSanEmbedOpConversion
     : public ConvertOpToLLVMPattern<tti::ExperimentalFPSanEmbedOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  ExperimentalFPSanEmbedOpConversion(LLVMTypeConverter &typeConverter,
+                                     const TargetInfoBase &targetInfo)
+      : ConvertOpToLLVMPattern<tti::ExperimentalFPSanEmbedOp>(typeConverter),
+        targetInfo(targetInfo) {}
 
   LogicalResult
   matchAndRewrite(tti::ExperimentalFPSanEmbedOp op, OpAdaptor adaptor,
@@ -177,7 +196,8 @@ struct ExperimentalFPSanEmbedOpConversion
     SmallVector<Value> resultVals;
     for (Value elem : unpackLLElements(loc, adaptor.getVal(), rewriter)) {
       Value raw = bitcastIfNeeded(rewriter, loc, elem, intTy);
-      resultVals.push_back(mixFloatToInt(rewriter, loc, raw, floatTy));
+      resultVals.push_back(
+          mixFloatToInt(rewriter, loc, raw, floatTy, targetInfo));
     }
 
     Value result = packLLElements(loc, getTypeConverter(), resultVals, rewriter,
@@ -185,6 +205,9 @@ struct ExperimentalFPSanEmbedOpConversion
     rewriter.replaceOp(op, result);
     return success();
   }
+
+private:
+  const TargetInfoBase &targetInfo;
 };
 
 struct ExperimentalFPSanUnembedOpConversion
@@ -213,8 +236,9 @@ struct ExperimentalFPSanUnembedOpConversion
 
 } // namespace
 
-void mlir::triton::populateFpSanToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                               RewritePatternSet &patterns) {
-  patterns.add<ExperimentalFPSanEmbedOpConversion,
-               ExperimentalFPSanUnembedOpConversion>(typeConverter);
+void mlir::triton::populateFpSanToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfoBase &targetInfo) {
+  patterns.add<ExperimentalFPSanEmbedOpConversion>(typeConverter, targetInfo);
+  patterns.add<ExperimentalFPSanUnembedOpConversion>(typeConverter);
 }

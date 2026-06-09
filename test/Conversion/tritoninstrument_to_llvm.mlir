@@ -116,6 +116,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
 // CHECK-LABEL: @experimental_fpsan_embed
 // CHECK-NOT: tti.experimental_fpsan_embed
 // CHECK: llvm.bitcast %arg0 : f32 to i32
+// CHECK: llvm.inline_asm {{.*}}"and.b32 $0, $1, 0x7fffffff;", "=r,r"
 // CHECK: llvm.mul
 // CHECK: llvm.xor
 tt.func private @experimental_fpsan_embed(%arg0: f32) -> i32 {

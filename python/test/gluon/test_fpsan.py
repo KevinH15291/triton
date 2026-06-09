@@ -2592,6 +2592,38 @@ def test_reduction_matches_loop(device, fresh_knobs):
     _assert_payload_equal(reduce_out, loop_out)
 
 
+def test_reduction_preserves_snan_payload(device, fresh_knobs):
+    _require_cuda_backend(device)
+    if not is_cuda():
+        pytest.skip("regression is specific to NVPTX fabs lowering")
+
+    @triton.jit
+    def sum_block_kernel(x_ptr, out_ptr):
+        offsets_m = tl.arange(0, 32)[:, None]
+        offsets_n = tl.arange(0, 128)[None, :]
+        offsets = offsets_m * 128 + offsets_n
+        acc = tl.zeros((32, 128), tl.float32)
+        for i in range(32):
+            acc += tl.load(x_ptr + i * 4096 + offsets)
+        tl.store(out_ptr + offsets, acc)
+
+    fresh_knobs.compilation.instrumentation_mode = "fpsan"
+
+    raw_input = np.asarray([0x29BFB965], dtype=np.int32)
+    input_payload = _mix_f32_bits_to_payload_u32(raw_input).astype(np.uint64)
+    expected = _unmix_payload_u32_to_f32_bits_i32((input_payload * np.uint64(32)).astype(np.uint32))[0]
+
+    x = torch.full((32, 4096), int(raw_input[0]), dtype=torch.int32, device="cuda")
+    out = torch.empty((4096, ), dtype=torch.int32, device="cuda")
+    sum_block_kernel[(1, )](
+        triton.TensorWrapper(x, dtype=torch.float32),
+        triton.TensorWrapper(out, dtype=torch.float32),
+        num_warps=4,
+    )
+
+    _assert_payload_equal(out, torch.full_like(out, int(expected)))
+
+
 @pytest.mark.skipif(not (is_hip_cdna3() or is_hip_cdna4()), reason="Requires CDNA3 or CDNA4")
 @pytest.mark.parametrize(("type_a", "type_b", "acc_type", "m", "n", "k", "instr_m", "instr_n", "instr_k", "k_width"),
                          _MFMA_DOT_CASES)

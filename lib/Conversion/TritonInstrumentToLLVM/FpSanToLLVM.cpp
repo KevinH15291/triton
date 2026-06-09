@@ -125,9 +125,11 @@ Value mixFloatToInt(ConversionPatternRewriter &rewriter, Location loc, Value u,
       selectUIntConstantOnSign(rewriter, loc, u, cfg.signMask, 0, cfg.signMask);
   Value mulA = createUIntConstant(rewriter, loc, u.getType(), cfg.mulA);
   Value magMask = createUIntConstant(rewriter, loc, u.getType(), cfg.magMask);
-  // The mask reduces modulo signMask, so the sign bit contributes zero to the
-  // product. Avoid clearing it first: LLVM can fold that pattern to fabs,
-  // which does not preserve NaN payload bits on NVPTX.
+  // Avoid patterns that InstCombine rewrites to `llvm.fabs`. LLVM specifies
+  // that `llvm.fabs` preserves the NaN quiet/signaling bit and payload, but
+  // NVPTX lowers it to PTX `abs.f32`, whose NaN result is unspecified. On
+  // Blackwell, `abs.f32` is observed to canonicalize signaling NaNs, corrupting
+  // FPSan payloads.
   Value yMul = b.mul(u, mulA);
   Value y = b.and_(yMul, magMask);
   Value z = xorShiftRight(rewriter, loc, y, cfg.shift);
@@ -147,7 +149,6 @@ Value unmixIntToFloat(ConversionPatternRewriter &rewriter, Location loc,
   Value magMask = createUIntConstant(rewriter, loc, v.getType(), cfg.magMask);
   Value mulBInv = selectUIntConstantOnSign(rewriter, loc, v, cfg.signMask,
                                            cfg.mulBPosInv, cfg.mulBNegInv);
-  // The encoded sign bit likewise vanishes under the magnitude mask.
   Value zMul = b.mul(v, mulBInv);
   Value z = b.and_(zMul, magMask);
   Value y = inverseXorShiftRight(rewriter, loc, z, cfg);

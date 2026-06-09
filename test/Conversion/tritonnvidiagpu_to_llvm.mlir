@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm=compute-capability=90 --initialize-ws-cluster-barriers=compute-capability=90 -reconcile-unrealized-casts | FileCheck %s
 // RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=85' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=85' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX85 %s
 // RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=86' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=86' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX86 %s
+// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm=compute-capability=90 --initialize-ws-cluster-barriers=compute-capability=90 -reconcile-unrealized-casts -canonicalize | FileCheck --check-prefix=SUBSLICE %s
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -613,6 +614,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
 
 #local_gather_scatter_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 1]]}>
 #local_gather_scatter_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1]]}>
+#local_gather_subslice_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 0]]}>
+#local_gather_subslice_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @local_gather_scatter_two_ctas
@@ -630,6 +633,30 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %offs = arith.constant dense<0> : tensor<2x32xi32, #local_gather_scatter_blocked>
     %out_ptrs = tt.addptr %ptrs, %offs : tensor<2x32x!tt.ptr<i32>, #local_gather_scatter_blocked>, tensor<2x32xi32, #local_gather_scatter_blocked>
     tt.store %out_ptrs, %g : tensor<2x32x!tt.ptr<i32>, #local_gather_scatter_blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @local_gather_subslice_other_cta
+  // CHECK: nvvm.mapa
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<7> -> i32
+  // SUBSLICE-LABEL: @local_gather_subslice_other_cta
+  // SUBSLICE: %[[ONE:.*]] = llvm.mlir.constant(1 : i32) : i32
+  // SUBSLICE: %[[TWO:.*]] = llvm.mlir.constant(2 : i32) : i32
+  // SUBSLICE: %[[MASKED_BLOCK:.*]] = llvm.and %{{.*}}, %[[TWO]] : i32
+  // SUBSLICE-NEXT: %[[SHIFTED_BLOCK:.*]] = llvm.lshr %[[MASKED_BLOCK]], %[[ONE]] : i32
+  // SUBSLICE-NEXT: %[[BLOCK_OFFSET_BITS:.*]] = llvm.or disjoint %[[SHIFTED_BLOCK]], %{{.*}} : i32
+  // SUBSLICE-NEXT: %[[BLOCK_OFFSET:.*]] = llvm.xor %{{.*}}, %[[BLOCK_OFFSET_BITS]] : i32
+  // SUBSLICE: %[[TARGET_CTA:.*]] = llvm.xor %{{.*}}, %[[BLOCK_OFFSET]] : i32
+  // SUBSLICE: nvvm.mapa %{{.*}}, %[[TARGET_CTA]]
+  tt.func @local_gather_subslice_other_cta(%out: !tt.ptr<i32>) {
+    %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x32xi32, #local_gather_subslice_shared, #ttg.shared_memory, mutable>
+    %tile = ttg.memdesc_subslice %src [2, 0] : !ttg.memdesc<4x32xi32, #local_gather_subslice_shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<2x32xi32, #local_gather_subslice_shared, #ttg.shared_memory, mutable, 4x32>
+    %idx = arith.constant dense<0> : tensor<2x32xi32, #local_gather_subslice_blocked>
+    %g = ttg.local_gather %tile[%idx] {axis = 1 : i32} : !ttg.memdesc<2x32xi32, #local_gather_subslice_shared, #ttg.shared_memory, mutable, 4x32>, tensor<2x32xi32, #local_gather_subslice_blocked> -> tensor<2x32xi32, #local_gather_subslice_blocked>
+    %ptrs = tt.splat %out : !tt.ptr<i32> -> tensor<2x32x!tt.ptr<i32>, #local_gather_subslice_blocked>
+    %offs = arith.constant dense<0> : tensor<2x32xi32, #local_gather_subslice_blocked>
+    %out_ptrs = tt.addptr %ptrs, %offs : tensor<2x32x!tt.ptr<i32>, #local_gather_subslice_blocked>, tensor<2x32xi32, #local_gather_subslice_blocked>
+    tt.store %out_ptrs, %g : tensor<2x32x!tt.ptr<i32>, #local_gather_subslice_blocked>
     tt.return
   }
 }

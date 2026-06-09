@@ -563,8 +563,9 @@ computeLocalAddrs(Location loc, triton::gpu::MemDescType memDescTy,
   auto kOffset = str_attr("offset");
   auto kBlock = str_attr("block");
   bool isMultiCTA = invSharedLayout.getOutDimSize(kBlock) > 1;
-  // Get the subslice affine offset (non-zero for memdesc subslices)
-  Value affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
+  // Get the subslice affine offset and target CTA.
+  auto [affineOffset, affineBlockOffset] =
+      smemObj.getShmemOffsetAndBlock(loc, rewriter, memDescTy);
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
 
   SmallVector<LocalSharedMemoryAddress> addrs;
@@ -595,8 +596,10 @@ computeLocalAddrs(Location loc, triton::gpu::MemDescType memDescTy,
     auto [blockName, blockId] = outputs[1];
     assert(offsetName == kOffset && blockName == kBlock);
 
-    // For subslices, the physical offset is computed as:
+    // For subslices, the physical offset and target CTA are computed as:
     //   physical_offset = L⁻¹(coords) ⊕ L⁻¹(subslice_logical_offset)
+    //   target_cta = block(L⁻¹(coords)) ⊕
+    //                block(L⁻¹(subslice_logical_offset))
     //
     // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
     // enforces:
@@ -606,6 +609,7 @@ computeLocalAddrs(Location loc, triton::gpu::MemDescType memDescTy,
     // These constraints ensure the bit ranges of L⁻¹(coords) and
     // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
     offset = b.xor_(offset, affineOffset);
+    blockId = b.xor_(blockId, affineBlockOffset);
 
     // Add padding offset for padded layouts (non-linear component)
     Value ptr;
@@ -1294,8 +1298,8 @@ SmallVector<Type> SharedMemoryObject::getTypes() const {
   return types;
 }
 
-uint64_t
-SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
+std::pair<uint64_t, uint64_t> SharedMemoryObject::getMaskSpanOffsetsAndBlocks(
+    triton::gpu::MemDescType srcTy) {
   auto ctx = srcTy.getContext();
   auto shape = srcTy.getShape();
   auto allocShape = srcTy.getAllocShape();
@@ -1305,44 +1309,55 @@ SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
 
   // Early exist when there is no subview
   if (allocShape == shape) {
-    return 0;
+    return {0, 0};
   }
   auto totalLl =
       triton::gpu::isPaddedEncoding(srcTy.getEncoding())
           ? triton::gpu::paddedLinearLayout(allocShape, srcTy.getEncoding())
           : triton::gpu::toLinearLayout(allocShape, srcTy.getEncoding());
-  auto dimNames = standardOutDimNames(ctx, shape.size());
   // Map from dimNames to offset, block
   auto invLl = totalLl.pseudoinvert();
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
-  for (auto dim : standardOutDimNames(srcTy.getContext(), shape.size())) {
+  for (auto dim : standardOutDimNames(ctx, shape.size())) {
     logicalOffsets.push_back({dim, 0});
   }
 
-  auto ret = 0;
+  auto kOffset = str_attr("offset");
+  auto kBlock = str_attr("block");
+  uint64_t offsetMask = 0;
+  uint64_t blockMask = 0;
   for (auto [dim, shapes] : llvm::enumerate(llvm::zip(shape, allocShape))) {
     auto [shape, allocShape] = shapes;
     for (int j = llvm::Log2_32(shape); j < llvm::Log2_32(allocShape); ++j) {
       logicalOffsets[dim].second = 1 << j;
-      auto offsetAndBlock = invLl.apply(logicalOffsets);
-      ret |= offsetAndBlock[0].second;
-      assert(offsetAndBlock[1].second == 0);
+      for (auto [name, value] : invLl.apply(logicalOffsets)) {
+        if (name == kOffset)
+          offsetMask |= value;
+        else if (name == kBlock)
+          blockMask |= value;
+      }
     }
     // Reset the offset for the next dimension
     logicalOffsets[dim].second = 0;
   }
-  return ret;
+  return {offsetMask, blockMask};
 }
 
-Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
-                                         triton::gpu::MemDescType srcTy) const {
+uint64_t
+SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
+  return getMaskSpanOffsetsAndBlocks(srcTy).first;
+}
+
+std::pair<Value, Value> SharedMemoryObject::getShmemOffsetAndBlock(
+    Location loc, RewriterBase &rewriter,
+    triton::gpu::MemDescType srcTy) const {
   auto ctx = srcTy.getContext();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   // If it did not have a memdesc_subslice we don't need to compute the offset
   // as it is zero
   if (!isAffineSharedMemoryAccess(srcTy)) {
-    return b.i32_val(0);
+    return {b.i32_val(0), b.i32_val(0)};
   }
 
   // We return the offset without the padding. The padding will be added in the
@@ -1360,13 +1375,23 @@ Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
     logicalOffsets.push_back({dim, offset});
   }
 
-  // We don't allow for non-trivial block dimensions in the shared memory
-  // layout. We have in practice that offsetAndBlock[1].second is zero, but we
-  // cannot assert that without constant propagation so we just discard it.
-  auto offset =
-      applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets)[0]
-          .second;
-  return offset;
+  Value offset = b.i32_val(0);
+  Value block = b.i32_val(0);
+  auto kOffset = str_attr("offset");
+  auto kBlock = str_attr("block");
+  for (auto [name, value] :
+       applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets)) {
+    if (name == kOffset)
+      offset = value;
+    else if (name == kBlock)
+      block = value;
+  }
+  return {offset, block};
+}
+
+Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
+                                         triton::gpu::MemDescType srcTy) const {
+  return getShmemOffsetAndBlock(loc, rewriter, srcTy).first;
 }
 
 Value SharedMemoryObject::getShmemAffineBase(

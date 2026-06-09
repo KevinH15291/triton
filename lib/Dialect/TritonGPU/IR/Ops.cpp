@@ -1151,6 +1151,7 @@ LogicalResult MemDescSubsliceOp::verify() {
   }
 
   auto llInv = ll.pseudoinvert();
+  bool splitsAcrossCTAs = false;
   for (auto dim : splitDims) {
     auto kDim = mlir::StringAttr::get(ctx, "dim" + llvm::Twine(dim));
     llvm::SmallVector<std::pair<mlir::StringAttr, int32_t>> namedOffsets;
@@ -1168,9 +1169,21 @@ LogicalResult MemDescSubsliceOp::verify() {
             "We don't support splitting along the swizzling pattern");
       }
       if (block.second != 0) {
-        return emitError("We don't support splitting along CTA dimensions");
+        if (!llvm::isPowerOf2_32(block.second)) {
+          return emitError(
+              "We don't support splitting along the CTA swizzling pattern");
+        }
+        splitsAcrossCTAs = true;
       }
     }
+  }
+  if (splitsAcrossCTAs &&
+      (getResult().use_empty() ||
+       !llvm::all_of(getResult().getUsers(), [](Operation *user) {
+         return isa<LocalGatherOp>(user);
+       }))) {
+    return emitError("Splitting along CTA dimensions is only supported for "
+                     "local gather");
   }
   return success();
 }

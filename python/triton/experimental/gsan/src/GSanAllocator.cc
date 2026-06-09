@@ -93,18 +93,18 @@ size_t roundUp(size_t val, size_t alignment) {
   return cdiv(val, alignment) * alignment;
 }
 
-uint32_t roundDownToPowerOfTwo(uint32_t x) {
+constexpr size_t roundDownToPowerOfTwo(size_t x) {
   if (x == 0)
     return 0;
 
-  x |= x >> 1;
-  x |= x >> 2;
-  x |= x >> 4;
-  x |= x >> 8;
-  x |= x >> 16;
+  for (unsigned shift = 1; shift < std::numeric_limits<size_t>::digits;
+       shift <<= 1)
+    x |= x >> shift;
 
   return x - (x >> 1);
 }
+static_assert(roundDownToPowerOfTwo((size_t{1} << 36) + 1) ==
+              (size_t{1} << 36));
 
 size_t getShadowSize(size_t realMemSize) {
   auto wordSize = cdiv(realMemSize, gsan::kShadowMemGranularityBytes);
@@ -645,6 +645,13 @@ void *gsanGetReservePointer() {
   return reinterpret_cast<void *>(alloc->reserveBaseAddress);
 }
 
+size_t gsanGetRealMemoryCapacity() {
+  std::lock_guard lg(mut);
+  if (gsanEnsureInit() != 0)
+    return 0;
+  return alloc->treeRoot.size;
+}
+
 int gsanExportAllocationHandles(void *void_ptr, int *realFd, int *shadowFd,
                                 size_t *allocSize) {
   if (realFd == nullptr || shadowFd == nullptr || allocSize == nullptr)
@@ -945,6 +952,10 @@ PyObject *pyGetReserveSize(PyObject *self, PyObject *args) {
   return PyLong_FromUnsignedLongLong(gsan::kReserveSize);
 }
 
+PyObject *pyGetRealMemoryCapacity(PyObject *self, PyObject *args) {
+  return PyLong_FromSize_t(gsanGetRealMemoryCapacity());
+}
+
 PyObject *pyGetShadowSizeBytes(PyObject *self, PyObject *args) {
   return PyLong_FromLong(sizeof(gsan::ShadowCell));
 }
@@ -1136,6 +1147,9 @@ PyMethodDef kGSanAllocatorMethods[] = {
      METH_FASTCALL, "Return the reserve base pointer as an integer."},
     {"get_reserve_size", reinterpret_cast<PyCFunction>(pyGetReserveSize),
      METH_NOARGS, "Return the reserve size in bytes."},
+    {"get_real_memory_capacity",
+     reinterpret_cast<PyCFunction>(pyGetRealMemoryCapacity), METH_NOARGS,
+     "Return the real-memory allocator capacity in bytes."},
     {"get_shadow_size_bytes",
      reinterpret_cast<PyCFunction>(pyGetShadowSizeBytes), METH_NOARGS,
      "Return the shadow cell size in bytes."},

@@ -259,6 +259,10 @@ GSAN_DEVICE Range roundRange(Range x) {
   return x;
 }
 
+GSAN_DEVICE bool rangeMayBeGsanManaged(Range range, uintptr_t reserveBase) {
+  return range.start < reserveBase + kReserveSize && reserveBase < range.end;
+}
+
 GSAN_DEVICE ShadowCell *acquireShadow(uintptr_t shadowAddr) {
   auto cell = reinterpret_cast<ShadowCell *>(shadowAddr);
   uint16_t actual = 0;
@@ -477,6 +481,8 @@ GSAN_DEVICE void readRange(ThreadState *state, uintptr_t read_addr, int nBytes,
   auto range = roundRange(Range{read_addr, read_addr + nBytes});
 
   auto reserveBase = state->reserveBase;
+  if (!rangeMayBeGsanManaged(range, reserveBase))
+    return;
   rwLockAcquireRead(state->lock);
 
   for (uintptr_t addr = range.start; addr < range.end;

@@ -358,33 +358,22 @@ static void instrumentAsyncTMAScatter(ttng::AsyncTMAScatterOp op) {
 }
 
 static Value getGSanStateForCall(tt::CallOp callOp, Value gsanState) {
-  auto partitions =
-      callOp->getParentOfType<ttg::WarpSpecializePartitionsOp>();
+  auto partitions = callOp->getParentOfType<ttg::WarpSpecializePartitionsOp>();
   if (!partitions)
     return gsanState;
 
-  unsigned captureIdx = partitions.getNumOperands();
-  for (auto [idx, capture] :
-       llvm::enumerate(partitions.getExplicitCaptures())) {
-    if (capture == gsanState) {
-      captureIdx = idx;
-      break;
-    }
-  }
-
-  if (captureIdx == partitions.getNumOperands()) {
+  auto captures = partitions.getExplicitCaptures();
+  auto capture = llvm::find(captures, gsanState);
+  unsigned captureIdx = std::distance(captures.begin(), capture);
+  if (capture == captures.end()) {
     partitions->insertOperands(captureIdx, gsanState);
     for (Region &region : partitions.getPartitionRegions())
       region.addArgument(gsanState.getType(), callOp.getLoc());
   }
 
   Region *partitionRegion = callOp->getParentRegion();
-  while (partitionRegion &&
-         partitionRegion->getParentOp() != partitions.getOperation()) {
+  while (partitionRegion->getParentOp() != partitions.getOperation())
     partitionRegion = partitionRegion->getParentRegion();
-  }
-  assert(partitionRegion &&
-         "expected call to be nested in a warp-specialize partition");
   return partitionRegion->getArgument(captureIdx);
 }
 

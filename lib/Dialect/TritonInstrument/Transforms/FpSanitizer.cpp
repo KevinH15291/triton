@@ -751,9 +751,6 @@ Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
   Value result = arith::AddIOp::create(rewriter, loc, one, term1);
   result = arith::AddIOp::create(rewriter, loc, result, term2);
 
-  if (3 * shift >= bitWidth)
-    return unembedToFloat(rewriter, loc, result, floatTy);
-
   unsigned choose3Bits = bitWidth - 3 * shift;
   uint64_t choose3InputMask = (uint64_t{1} << (choose3Bits + 1)) - 1;
   auto choose3Mask =
@@ -3018,29 +3015,8 @@ struct ExternElementwisePattern
         op.getNumOperands() == 0 || !externHasNumericOperands(op))
       return failure();
 
-    if (op.getNumOperands() == 1) {
-      StringRef symbol = op.getSymbol();
-      if (symbol == "__nv_expf" && isF32Like(op.getType()) &&
-          isF32Like(op.getOperand(0).getType()))
-        return replaceOp(op, fpsanExp(rewriter, op.getLoc(), op.getOperand(0)),
-                         rewriter);
-      if (symbol == "__nv_exp2f" && isF32Like(op.getType()) &&
-          isF32Like(op.getOperand(0).getType()))
-        return replaceOp(op, fpsanExp2(rewriter, op.getLoc(), op.getOperand(0)),
-                         rewriter);
-    }
-
     uint64_t hash = stableStringHash(op.getSymbol());
     Value result = fpsanVariadicExternTagged(rewriter, op.getLoc(), op, hash);
-    if (!result)
-      return emitFpSanCodegenError(op.getOperation());
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-
-private:
-  static LogicalResult replaceOp(tt::ExternElementwiseOp op, Value result,
-                                 PatternRewriter &rewriter) {
     if (!result)
       return emitFpSanCodegenError(op.getOperation());
     rewriter.replaceOp(op, result);
@@ -3055,32 +3031,16 @@ struct ElementwiseInlineAsmPattern
   LogicalResult matchAndRewrite(tt::ElementwiseInlineAsmOp op,
                                 PatternRewriter &rewriter) const override {
     if (op.getPackedElement() != 1 || op.getNumResults() != 1 ||
-        !isF32Like(op->getResult(0).getType()))
+        !isF32Like(op->getResult(0).getType()) || op.getNumOperands() != 1 ||
+        !isF32Like(op.getOperand(0).getType()) ||
+        normalizeInlineAsm(op.getAsmString()) != "ex2.approx.ftz.f32$0,$1;")
       return failure();
 
-    std::string asmString = normalizeInlineAsm(op.getAsmString());
-    if (asmString == "mul.rn.f32$0,$1,$2;" && op.getNumOperands() == 2 &&
-        llvm::all_of(op.getOperands(), [](Value operand) {
-          return isF32Like(operand.getType());
-        })) {
-      auto loc = op.getLoc();
-      auto lhs = embedToInt(rewriter, loc, op.getOperand(0));
-      auto rhs = embedToInt(rewriter, loc, op.getOperand(1));
-      auto result = arith::MulIOp::create(rewriter, loc, lhs, rhs);
-      rewriter.replaceOp(op, unembedToFloat(rewriter, loc, result,
-                                            op->getResult(0).getType()));
-      return success();
-    }
-
-    if (asmString == "ex2.approx.ftz.f32$0,$1;" && op.getNumOperands() == 1 &&
-        isF32Like(op.getOperand(0).getType())) {
-      Value result = fpsanExp2(rewriter, op.getLoc(), op.getOperand(0));
-      if (!result)
-        return emitFpSanCodegenError(op.getOperation());
-      rewriter.replaceOp(op, result);
-      return success();
-    }
-    return failure();
+    Value result = fpsanExp2(rewriter, op.getLoc(), op.getOperand(0));
+    if (!result)
+      return emitFpSanCodegenError(op.getOperation());
+    rewriter.replaceOp(op, result);
+    return success();
   }
 };
 

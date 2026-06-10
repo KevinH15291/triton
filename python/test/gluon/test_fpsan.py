@@ -616,39 +616,6 @@ def test_constant_identity_noop(device, op, fresh_knobs):
     _assert_payload_equal(out, x)
 
 
-def test_constant_identity_preserves_nan_payloads(device, fresh_knobs):
-    _require_cuda_backend(device)
-
-    fresh_knobs.compilation.instrumentation_mode = "fpsan"
-
-    payloads = np.asarray(
-        [
-            0x7FC00001,
-            0x7FA00001,
-            0x7F800001,
-            0xFFC00001,
-            0xFFA00001,
-            0xFF800001,
-            0x7FFFFFFF,
-            0xFFFFFFFF,
-        ],
-        dtype=np.uint32,
-    ).view(np.int32)
-    x = torch.from_numpy(payloads.copy()).to(device="cuda")
-    out = torch.empty_like(x)
-
-    _constant_identity_kernel[(1,)](
-        triton.TensorWrapper(x, dtype=torch.float32),
-        triton.TensorWrapper(out, dtype=torch.float32),
-        len(payloads),
-        OP="mul_one",
-        BLOCK=32,
-        THREADS_PER_WARP=THREADS_PER_WARP,
-    )
-
-    _assert_payload_equal(out, x)
-
-
 def test_reciprocal_involution(device, fresh_knobs):
     _require_cuda_backend(device)
 

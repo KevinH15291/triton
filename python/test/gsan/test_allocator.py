@@ -7,9 +7,8 @@ import torch
 
 from triton._internal_testing import is_cuda
 from triton.experimental.gsan import create_mem_pool
-from triton.experimental.gsan._allocator import (export_allocation_handles, free_allocation, get_real_memory_capacity,
-                                                 get_reserve_pointer, get_reserve_size, gsan_free, gsan_malloc,
-                                                 import_allocation_handles)
+from triton.experimental.gsan._allocator import (export_allocation_handles, free_allocation, get_reserve_pointer,
+                                                 get_reserve_size, gsan_free, gsan_malloc, import_allocation_handles)
 from triton.experimental.gsan._testing_utils import shadow_tensor_for
 from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
 
@@ -56,11 +55,6 @@ def test_malloc_edge_cases(_direct_allocator):
 
     # Null free is a no-op.
     free(0)
-
-
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
-def test_real_memory_capacity():
-    assert get_real_memory_capacity() == 64 * 1024**3
 
 
 def test_malloc_free(_direct_allocator):

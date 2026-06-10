@@ -63,10 +63,6 @@ def get_reserve_size() -> int:
     return _load_gsan_module().get_reserve_size()
 
 
-def get_real_memory_capacity() -> int:
-    return _load_gsan_module().get_real_memory_capacity()
-
-
 def get_global_state_pointer() -> int:
     return _load_gsan_module().get_global_state_pointer()
 

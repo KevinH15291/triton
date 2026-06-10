@@ -30,6 +30,7 @@ namespace {
 Type getIntTypeLike(Type ty);
 bool isFloatLike(Type ty) { return isa<FloatType>(getElementTypeOrSelf(ty)); }
 bool isIntLike(Type ty) { return isa<IntegerType>(getElementTypeOrSelf(ty)); }
+
 bool isNumericLike(Type ty) {
   Type elemTy = getElementTypeOrSelf(ty);
   return isa<FloatType>(elemTy) || isa<IntegerType>(elemTy);
@@ -732,13 +733,12 @@ Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
   unsigned bitWidth = getIntBitwidth(xI.getType());
   unsigned shift = (bitWidth + 3) / 4;
   auto one = getIntConstantLike(rewriter, loc, xI.getType(), 1);
-  auto shiftOne = one;
   auto shiftBase = getIntConstantLike(rewriter, loc, xI.getType(), shift);
   auto shiftBase2 = getIntConstantLike(rewriter, loc, xI.getType(), 2 * shift);
 
   Value xMinusOne = arith::SubIOp::create(rewriter, loc, xI, one);
   Value choose2Twice = arith::MulIOp::create(rewriter, loc, xI, xMinusOne);
-  Value choose2 = arith::ShRUIOp::create(rewriter, loc, choose2Twice, shiftOne);
+  Value choose2 = arith::ShRUIOp::create(rewriter, loc, choose2Twice, one);
 
   Value term1 = arith::ShLIOp::create(rewriter, loc, xI, shiftBase);
   Value term2 = arith::ShLIOp::create(rewriter, loc, choose2, shiftBase2);

@@ -1181,10 +1181,12 @@ LogicalResult MemDescSubsliceOp::verify() {
       (getResult().use_empty() ||
        !llvm::all_of(getResult().getUsers(), [](Operation *user) {
          return isa<LocalLoadOp, LocalStoreOp, LocalGatherOp, LocalScatterOp,
-                    LocalAtomicScatterRMWOp>(user);
+                    LocalAtomicScatterRMWOp, nvidia_gpu::AsyncSharedStoreOp>(
+             user);
        }))) {
     return emitError("Splitting along CTA dimensions is only supported for "
-                     "local load, store, gather, scatter, and atomic scatter");
+                     "local load, store, gather, scatter, atomic scatter, and "
+                     "async shared store");
   }
   return success();
 }

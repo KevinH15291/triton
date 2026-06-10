@@ -173,7 +173,7 @@ tt.func public @subview_along_swizzling(%arg0: !ttg.memdesc<8x16xf32, #shared, #
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32} {
   tt.func public @subslice_across_ctas_unsupported_user(%arg0: !ttg.memdesc<4x32xf32, #shared, #smem, mutable>) {
-    // expected-error @+1 {{Splitting along CTA dimensions is only supported for local load, store, gather, scatter, and atomic scatter}}
+    // expected-error @+1 {{Splitting along CTA dimensions is only supported for local load, store, gather, scatter, atomic scatter, and async shared store}}
     %tile = ttg.memdesc_subslice %arg0 [2, 0] : !ttg.memdesc<4x32xf32, #shared, #smem, mutable> -> !ttg.memdesc<2x32xf32, #shared, #smem, mutable, 4x32>
     ttg.local_dealloc %tile : !ttg.memdesc<2x32xf32, #shared, #smem, mutable, 4x32>
     tt.return

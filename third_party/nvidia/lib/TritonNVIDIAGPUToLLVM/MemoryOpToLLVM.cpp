@@ -376,8 +376,10 @@ static void lowerAsyncSharedStore(Location loc, MLIRContext *ctx,
     return;
   }
 
-  auto affineOffset = dstMemObj.getShmemOffset(loc, rewriter, dstTy);
-  auto maskSpanAffineOffset = dstMemObj.getMaskSpanOffsets(dstTy);
+  auto [affineOffset, affineBlockOffset] =
+      dstMemObj.getShmemOffsetAndBlock(loc, rewriter, dstTy);
+  auto [maskSpanAffineOffset, maskSpanAffineBlock] =
+      dstMemObj.getMaskSpanOffsetsAndBlocks(dstTy);
   std::optional<int> maybeMaxVecElems;
   SmallVector<std::pair<unsigned, unsigned>> paddingShifts;
   if (triton::gpu::isPaddedEncoding(dstTy.getEncoding())) {
@@ -405,8 +407,8 @@ static void lowerAsyncSharedStore(Location loc, MLIRContext *ctx,
   };
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   lowerLdSt(loc, ctx, cvt, vals, llvmElemTy, smemBases, paddingShifts,
-            affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
-            /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+            affineOffset, maskSpanAffineOffset, affineBlockOffset,
+            maskSpanAffineBlock, laneId, warpId, rewriter, targetInfo,
             maybeMaxVecElems, emitSt);
 }
 

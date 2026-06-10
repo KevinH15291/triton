@@ -167,6 +167,37 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 0]]}>
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: async_shared_store_subslice_other_cta
+  // CHECK: nvvm.mapa
+  // CHECK: nvvm.mapa
+  // CHECK: st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.b32
+  // SUBSLICE-LABEL: @async_shared_store_subslice_other_cta
+  // SUBSLICE: %[[ASYNC_ONE:.*]] = llvm.mlir.constant(1 : i32) : i32
+  // SUBSLICE: %[[ASYNC_TWO:.*]] = llvm.mlir.constant(2 : i32) : i32
+  // SUBSLICE: %[[ASYNC_ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
+  // SUBSLICE: %[[ASYNC_BLOCK_BITS:.*]] = llvm.and %{{.*}}, %[[ASYNC_TWO]] : i32
+  // SUBSLICE-NEXT: %[[ASYNC_BLOCK_BIT:.*]] = llvm.lshr %[[ASYNC_BLOCK_BITS]], %[[ASYNC_ONE]] : i32
+  // SUBSLICE-NEXT: %[[ASYNC_BLOCK_OR:.*]] = llvm.or disjoint %[[ASYNC_BLOCK_BIT]], %[[ASYNC_ZERO]] : i32
+  // SUBSLICE-NEXT: %[[ASYNC_BLOCK_OFFSET:.*]] = llvm.xor %[[ASYNC_ZERO]], %[[ASYNC_BLOCK_OR]] : i32
+  // SUBSLICE: llvm.xor %{{.*}}, %[[ASYNC_BLOCK_OFFSET]] : i32
+  // SUBSLICE: nvvm.mapa %{{.*}}, %[[ASYNC_TARGET_CTA:.*]]
+  // SUBSLICE-NEXT: nvvm.mapa %{{.*}}, %[[ASYNC_TARGET_CTA]]
+  tt.func @async_shared_store_subslice_other_cta(%src: tensor<2x32xi32, #blocked>) {
+    %dst = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x32xi32, #shared1, #smem, mutable>
+    %tile = ttg.memdesc_subslice %dst [2, 0] : !ttg.memdesc<4x32xi32, #shared1, #smem, mutable> -> !ttg.memdesc<2x32xi32, #shared1, #smem, mutable, 4x32>
+    %mbarrier = ttg.local_alloc {allocation.offset = 512 : i32} : () -> !ttg.memdesc<2xi64, #shared0, #smem, mutable>
+    ttng.async_shared_store %src, %tile, %mbarrier : tensor<2x32xi32, #blocked> -> !ttg.memdesc<2x32xi32, #shared1, #smem, mutable, 4x32>, !ttg.memdesc<2xi64, #shared0, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>

@@ -66,21 +66,16 @@ FailureOr<Value> emitSharedAtomicRMW(ConversionPatternRewriter &rewriter,
                                      Value value, RMWOp rmwOp, bool returnOld,
                                      bool isCluster, Value pred) {
   SmallVector<Value> vals{value};
-  auto addrSpace = isCluster ? PtxAtomicAddrSpace::SharedCluster
-                             : PtxAtomicAddrSpace::Shared;
   if (!returnOld) {
-    auto result = emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
-                                   MemSemantic::RELAXED, std::nullopt, pred,
-                                   /*vec=*/1, /*packed=*/1, addrSpace,
-                                   PtxAtomicInstr::Red);
+    auto result =
+        emitPtxSharedAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
+                               pred, isCluster, PtxAtomicInstr::Red);
     if (succeeded(result))
       return result;
   }
 
-  return emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
-                          MemSemantic::RELAXED, std::nullopt, pred,
-                          /*vec=*/1, /*packed=*/1, addrSpace,
-                          PtxAtomicInstr::Atom);
+  return emitPtxSharedAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
+                                pred, isCluster, PtxAtomicInstr::Atom);
 }
 
 LogicalResult lowerLdStMatrix(

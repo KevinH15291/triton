@@ -728,15 +728,15 @@ Value fpsanSRem(PatternRewriter &rewriter, Location loc, Value num, Value den) {
   return unembedToFloat(rewriter, loc, resI, num.getType());
 }
 
-// A fixed-base modular exponential in payload space.  With c = 1 + 2^8,
-// c^x mod 2^32 has the exact closed form below because all terms from the
-// fourth binomial term onward vanish.  This preserves
+// A fixed-base modular exponential in payload space.  For N in {32, 64}, with
+// c = 1 + 2^(N/4), c^x mod 2^N has the exact closed form below because all
+// terms from the fourth binomial term onward vanish.  This preserves
 // exp2(a + b) = exp2(a) * exp2(b) without a per-element exponentiation loop.
 Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
                        Type floatTy) {
   unsigned bitWidth = getIntBitwidth(xI.getType());
   auto one = getIntConstantLike(rewriter, loc, xI.getType(), 1);
-  if (bitWidth != 32) {
+  if (bitWidth != 32 && bitWidth != 64) {
     auto zero = getIntConstantLike(rewriter, loc, xI.getType(), 0);
     auto c = getIntConstantLike(rewriter, loc, xI.getType(), 0xa343836d);
     auto lower =
@@ -755,12 +755,11 @@ Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
     y = arith::MulIOp::create(rewriter, loc, y, y);
     Value bitIndex =
         arith::SubIOp::create(rewriter, loc, rewriter.getI32Type(), topBit, i);
-    Value shift =
-        castScalarIntToIntLike(rewriter, loc, bitIndex, xI.getType());
+    Value shift = castScalarIntToIntLike(rewriter, loc, bitIndex, xI.getType());
     Value bit = arith::ShLIOp::create(rewriter, loc, one, shift);
     auto masked = arith::AndIOp::create(rewriter, loc, xI, bit);
-    auto isZero = arith::CmpIOp::create(
-        rewriter, loc, arith::CmpIPredicate::eq, masked, zero);
+    auto isZero = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
+                                        masked, zero);
     auto factor = arith::SelectOp::create(rewriter, loc, isZero, one, c);
     y = arith::MulIOp::create(rewriter, loc, y, factor);
     scf::YieldOp::create(rewriter, loc, y);
@@ -770,35 +769,36 @@ Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
 
   auto two = getIntConstantLike(rewriter, loc, xI.getType(), 2);
   auto six = getIntConstantLike(rewriter, loc, xI.getType(), 6);
-  auto lowNineMask = getIntConstantLike(rewriter, loc, xI.getType(), 0x1ff);
+  uint64_t choose3InputMask = (uint64_t{1} << (bitWidth / 4 + 1)) - 1;
+  auto choose3Mask =
+      getIntConstantLike(rewriter, loc, xI.getType(), choose3InputMask);
   auto shiftOne = one;
-  auto shiftEight = getIntConstantLike(rewriter, loc, xI.getType(), 8);
-  auto shiftSixteen = getIntConstantLike(rewriter, loc, xI.getType(), 16);
-  auto shiftTwentyFour = getIntConstantLike(rewriter, loc, xI.getType(), 24);
+  auto shiftBase =
+      getIntConstantLike(rewriter, loc, xI.getType(), bitWidth / 4);
+  auto shiftBase2 =
+      getIntConstantLike(rewriter, loc, xI.getType(), bitWidth / 2);
+  auto shiftBase3 =
+      getIntConstantLike(rewriter, loc, xI.getType(), 3 * bitWidth / 4);
 
   Value xMinusOne = arith::SubIOp::create(rewriter, loc, xI, one);
-  Value choose2Twice =
-      arith::MulIOp::create(rewriter, loc, xI, xMinusOne);
-  Value choose2 =
-      arith::ShRUIOp::create(rewriter, loc, choose2Twice, shiftOne);
+  Value choose2Twice = arith::MulIOp::create(rewriter, loc, xI, xMinusOne);
+  Value choose2 = arith::ShRUIOp::create(rewriter, loc, choose2Twice, shiftOne);
 
-  // Only the low eight bits of C(x, 3) survive the final shift.  C(x, 3)
-  // modulo 2^8 has period 2^9, so reducing x first keeps the products small.
-  Value xLow = arith::AndIOp::create(rewriter, loc, xI, lowNineMask);
+  // Only the low N/4 bits of C(x, 3) survive the final shift.  C(x, 3)
+  // modulo 2^(N/4) has period 2^(N/4 + 1), so reducing x first keeps the
+  // products small.
+  Value xLow = arith::AndIOp::create(rewriter, loc, xI, choose3Mask);
   Value xLowMinusOne = arith::SubIOp::create(rewriter, loc, xLow, one);
   Value xLowMinusTwo = arith::SubIOp::create(rewriter, loc, xLow, two);
   Value choose3Numerator =
       arith::MulIOp::create(rewriter, loc, xLow, xLowMinusOne);
-  choose3Numerator = arith::MulIOp::create(rewriter, loc, choose3Numerator,
-                                          xLowMinusTwo);
-  Value choose3 =
-      arith::DivUIOp::create(rewriter, loc, choose3Numerator, six);
+  choose3Numerator =
+      arith::MulIOp::create(rewriter, loc, choose3Numerator, xLowMinusTwo);
+  Value choose3 = arith::DivUIOp::create(rewriter, loc, choose3Numerator, six);
 
-  Value term1 = arith::ShLIOp::create(rewriter, loc, xI, shiftEight);
-  Value term2 =
-      arith::ShLIOp::create(rewriter, loc, choose2, shiftSixteen);
-  Value term3 =
-      arith::ShLIOp::create(rewriter, loc, choose3, shiftTwentyFour);
+  Value term1 = arith::ShLIOp::create(rewriter, loc, xI, shiftBase);
+  Value term2 = arith::ShLIOp::create(rewriter, loc, choose2, shiftBase2);
+  Value term3 = arith::ShLIOp::create(rewriter, loc, choose3, shiftBase3);
   Value result = arith::AddIOp::create(rewriter, loc, one, term1);
   result = arith::AddIOp::create(rewriter, loc, result, term2);
   result = arith::AddIOp::create(rewriter, loc, result, term3);
@@ -3052,8 +3052,8 @@ struct ExternElementwisePattern
                          rewriter);
       if (symbol == "__nv_exp2f" && isF32Like(op.getType()) &&
           isF32Like(op.getOperand(0).getType()))
-        return replaceOp(
-            op, fpsanExp2(rewriter, op.getLoc(), op.getOperand(0)), rewriter);
+        return replaceOp(op, fpsanExp2(rewriter, op.getLoc(), op.getOperand(0)),
+                         rewriter);
     }
 
     uint64_t hash = stableStringHash(op.getSymbol());
@@ -3093,14 +3093,12 @@ struct ElementwiseInlineAsmPattern
       auto lhs = embedToInt(rewriter, loc, op.getOperand(0));
       auto rhs = embedToInt(rewriter, loc, op.getOperand(1));
       auto result = arith::MulIOp::create(rewriter, loc, lhs, rhs);
-      rewriter.replaceOp(
-          op, unembedToFloat(rewriter, loc, result,
-                             op->getResult(0).getType()));
+      rewriter.replaceOp(op, unembedToFloat(rewriter, loc, result,
+                                            op->getResult(0).getType()));
       return success();
     }
 
-    if (asmString == "ex2.approx.ftz.f32$0,$1;" &&
-        op.getNumOperands() == 1 &&
+    if (asmString == "ex2.approx.ftz.f32$0,$1;" && op.getNumOperands() == 1 &&
         isF32Like(op.getOperand(0).getType())) {
       Value result = fpsanExp2(rewriter, op.getLoc(), op.getOperand(0));
       if (!result)

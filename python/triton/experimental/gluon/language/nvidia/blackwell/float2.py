@@ -7,13 +7,52 @@ __all__ = [
     "unpack2",
     "pack",
     "unpack",
+    "pack_e4m3x2",
     "fma",
     "Float2Tensor",
 ]
 
 
+@ttgl.builtin
+def _is_fpsan(_semantic=None):
+    mode = getattr(_semantic.builder.options, "instrumentation_mode", "")
+    return ttgl.constexpr("fpsan" in mode)
+
+
+@jit
+def _pack_f32x2(x0, x1):
+    return ttgl.inline_asm_elementwise(
+        """
+        mov.b64 $0, { $1, $2 };
+        """,
+        "=l,r,r",
+        [x0, x1],
+        dtype=ttgl.int64,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@jit
+def _unpack_f32x2(x):
+    return ttgl.inline_asm_elementwise(
+        """
+        mov.b64 { $0, $1 }, $2;
+        """,
+        "=r,=r,l",
+        [x],
+        dtype=[ttgl.float32, ttgl.float32],
+        is_pure=True,
+        pack=1,
+    )
+
+
 @jit
 def _add_f32x2(a, b):
+    if _is_fpsan():
+        a0, a1 = _unpack_f32x2(a)
+        b0, b1 = _unpack_f32x2(b)
+        return _pack_f32x2(a0 + b0, a1 + b1)
     return ttgl.inline_asm_elementwise(
         """
         add.f32x2 $0, $1, $2;
@@ -28,6 +67,10 @@ def _add_f32x2(a, b):
 
 @jit
 def _sub_f32x2(a, b):
+    if _is_fpsan():
+        a0, a1 = _unpack_f32x2(a)
+        b0, b1 = _unpack_f32x2(b)
+        return _pack_f32x2(a0 - b0, a1 - b1)
     return ttgl.inline_asm_elementwise(
         """
         sub.f32x2 $0, $1, $2;
@@ -42,6 +85,10 @@ def _sub_f32x2(a, b):
 
 @jit
 def _mul_f32x2(a, b):
+    if _is_fpsan():
+        a0, a1 = _unpack_f32x2(a)
+        b0, b1 = _unpack_f32x2(b)
+        return _pack_f32x2(a0 * b0, a1 * b1)
     return ttgl.inline_asm_elementwise(
         """
         mul.f32x2 $0, $1, $2;
@@ -56,6 +103,11 @@ def _mul_f32x2(a, b):
 
 @jit
 def _fma_f32x2(a, b, c):
+    if _is_fpsan():
+        a0, a1 = _unpack_f32x2(a)
+        b0, b1 = _unpack_f32x2(b)
+        c0, c1 = _unpack_f32x2(c)
+        return _pack_f32x2(a0 * b0 + c0, a1 * b1 + c1)
     return ttgl.inline_asm_elementwise(
         """
         fma.rn.f32x2 $0, $1, $2, $3;
@@ -98,28 +150,42 @@ class Float2Tensor:
 
 @jit
 def pack2(x0, x1):
-    value = ttgl.inline_asm_elementwise(
-        """
-        mov.b64 $0, { $1, $2 };
-        """,
-        "=l,r,r",
-        [x0, x1],
-        dtype=ttgl.int64,
-        is_pure=True,
-        pack=1,
-    )
-    return Float2Tensor(value)
+    return Float2Tensor(_pack_f32x2(x0, x1))
 
 
 @jit
 def unpack2(x):
+    return _unpack_f32x2(x.value)
+
+
+@jit
+def pack_e4m3x2(x, saturate_inf: ttgl.constexpr = False):
+    if saturate_inf:
+        x0, x1 = unpack2(x)
+        x0_clipped = ttgl.clamp(x0, -448.0, 448.0)
+        x1_clipped = ttgl.clamp(x1, -448.0, 448.0)
+        if _is_fpsan():
+            x0, x1 = x0_clipped, x1_clipped
+        else:
+            x0 = ttgl.where(x0 == x0, x0_clipped, 448.0)
+            x1 = ttgl.where(x1 == x1, x1_clipped, 448.0)
+        x = pack2(x0, x1)
+    if _is_fpsan():
+        x0, x1 = unpack2(x)
+        x0 = x0.to(ttgl.float8e4nv).to(ttgl.uint8, bitcast=True).to(ttgl.uint16)
+        x1 = x1.to(ttgl.float8e4nv).to(ttgl.uint8, bitcast=True).to(ttgl.uint16)
+        return (x0 | (x1 << 8)).to(ttgl.int16, bitcast=True)
     return ttgl.inline_asm_elementwise(
         """
-        mov.b64 { $0, $1 }, $2;
+        {
+            .reg .f32 lane<2>;
+            mov.b64 {lane0, lane1}, $1;
+            cvt.rn.satfinite.e4m3x2.f32 $0, lane1, lane0;
+        }
         """,
-        "=r,=r,l",
+        "=h,l",
         [x.value],
-        dtype=[ttgl.float32, ttgl.float32],
+        dtype=ttgl.int16,
         is_pure=True,
         pack=1,
     )

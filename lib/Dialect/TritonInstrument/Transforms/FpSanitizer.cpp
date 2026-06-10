@@ -12,6 +12,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include <cassert>
 
 namespace mlir {
@@ -30,6 +31,10 @@ namespace {
 Type getIntTypeLike(Type ty);
 bool isFloatLike(Type ty) { return isa<FloatType>(getElementTypeOrSelf(ty)); }
 bool isIntLike(Type ty) { return isa<IntegerType>(getElementTypeOrSelf(ty)); }
+bool isF32Like(Type ty) {
+  auto floatTy = dyn_cast<FloatType>(getElementTypeOrSelf(ty));
+  return floatTy && floatTy.getWidth() == 32;
+}
 
 bool isNumericLike(Type ty) {
   Type elemTy = getElementTypeOrSelf(ty);
@@ -723,42 +728,81 @@ Value fpsanSRem(PatternRewriter &rewriter, Location loc, Value num, Value den) {
   return unembedToFloat(rewriter, loc, resI, num.getType());
 }
 
-// Modular exponentiation in payload space; this preserves
-// exp2(a + b) = exp2(a) * exp2(b) under the integer rewrite.
+// A fixed-base modular exponential in payload space.  With c = 1 + 2^8,
+// c^x mod 2^32 has the exact closed form below because all terms from the
+// fourth binomial term onward vanish.  This preserves
+// exp2(a + b) = exp2(a) * exp2(b) without a per-element exponentiation loop.
 Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
                        Type floatTy) {
   unsigned bitWidth = getIntBitwidth(xI.getType());
   auto one = getIntConstantLike(rewriter, loc, xI.getType(), 1);
-  auto zero = getIntConstantLike(rewriter, loc, xI.getType(), 0);
-  auto c = getIntConstantLike(rewriter, loc, xI.getType(), 0xa343836d);
+  if (bitWidth != 32) {
+    auto zero = getIntConstantLike(rewriter, loc, xI.getType(), 0);
+    auto c = getIntConstantLike(rewriter, loc, xI.getType(), 0xa343836d);
+    auto lower =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+    auto upper = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(bitWidth));
+    auto step =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(1));
+    auto topBit = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(bitWidth - 1));
+    auto loop = scf::ForOp::create(rewriter, loc, lower, upper, step, one);
+    rewriter.setInsertionPointToStart(loop.getBody());
 
-  auto lower =
-      arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
-  auto upper = arith::ConstantOp::create(rewriter, loc,
-                                         rewriter.getI32IntegerAttr(bitWidth));
-  auto step =
-      arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(1));
-  auto topBit = arith::ConstantOp::create(
-      rewriter, loc, rewriter.getI32IntegerAttr(bitWidth - 1));
-  auto loop = scf::ForOp::create(rewriter, loc, lower, upper, step, one);
-  rewriter.setInsertionPointToStart(loop.getBody());
+    Value i = loop.getInductionVar();
+    Value y = loop.getRegionIterArgs()[0];
+    y = arith::MulIOp::create(rewriter, loc, y, y);
+    Value bitIndex =
+        arith::SubIOp::create(rewriter, loc, rewriter.getI32Type(), topBit, i);
+    Value shift =
+        castScalarIntToIntLike(rewriter, loc, bitIndex, xI.getType());
+    Value bit = arith::ShLIOp::create(rewriter, loc, one, shift);
+    auto masked = arith::AndIOp::create(rewriter, loc, xI, bit);
+    auto isZero = arith::CmpIOp::create(
+        rewriter, loc, arith::CmpIPredicate::eq, masked, zero);
+    auto factor = arith::SelectOp::create(rewriter, loc, isZero, one, c);
+    y = arith::MulIOp::create(rewriter, loc, y, factor);
+    scf::YieldOp::create(rewriter, loc, y);
+    rewriter.setInsertionPointAfter(loop);
+    return unembedToFloat(rewriter, loc, loop.getResult(0), floatTy);
+  }
 
-  Value i = loop.getInductionVar();
-  Value y = loop.getRegionIterArgs()[0];
-  y = arith::MulIOp::create(rewriter, loc, y, y);
-  Value bitIndex =
-      arith::SubIOp::create(rewriter, loc, rewriter.getI32Type(), topBit, i);
-  Value shift = castScalarIntToIntLike(rewriter, loc, bitIndex, xI.getType());
-  Value bit = arith::ShLIOp::create(rewriter, loc, one, shift);
-  auto masked = arith::AndIOp::create(rewriter, loc, xI, bit);
-  auto isZero = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                                      masked, zero);
-  auto factor = arith::SelectOp::create(rewriter, loc, isZero, one, c);
-  y = arith::MulIOp::create(rewriter, loc, y, factor);
-  scf::YieldOp::create(rewriter, loc, y);
-  rewriter.setInsertionPointAfter(loop);
+  auto two = getIntConstantLike(rewriter, loc, xI.getType(), 2);
+  auto six = getIntConstantLike(rewriter, loc, xI.getType(), 6);
+  auto lowNineMask = getIntConstantLike(rewriter, loc, xI.getType(), 0x1ff);
+  auto shiftOne = one;
+  auto shiftEight = getIntConstantLike(rewriter, loc, xI.getType(), 8);
+  auto shiftSixteen = getIntConstantLike(rewriter, loc, xI.getType(), 16);
+  auto shiftTwentyFour = getIntConstantLike(rewriter, loc, xI.getType(), 24);
 
-  return unembedToFloat(rewriter, loc, loop.getResult(0), floatTy);
+  Value xMinusOne = arith::SubIOp::create(rewriter, loc, xI, one);
+  Value choose2Twice =
+      arith::MulIOp::create(rewriter, loc, xI, xMinusOne);
+  Value choose2 =
+      arith::ShRUIOp::create(rewriter, loc, choose2Twice, shiftOne);
+
+  // Only the low eight bits of C(x, 3) survive the final shift.  C(x, 3)
+  // modulo 2^8 has period 2^9, so reducing x first keeps the products small.
+  Value xLow = arith::AndIOp::create(rewriter, loc, xI, lowNineMask);
+  Value xLowMinusOne = arith::SubIOp::create(rewriter, loc, xLow, one);
+  Value xLowMinusTwo = arith::SubIOp::create(rewriter, loc, xLow, two);
+  Value choose3Numerator =
+      arith::MulIOp::create(rewriter, loc, xLow, xLowMinusOne);
+  choose3Numerator = arith::MulIOp::create(rewriter, loc, choose3Numerator,
+                                          xLowMinusTwo);
+  Value choose3 =
+      arith::DivUIOp::create(rewriter, loc, choose3Numerator, six);
+
+  Value term1 = arith::ShLIOp::create(rewriter, loc, xI, shiftEight);
+  Value term2 =
+      arith::ShLIOp::create(rewriter, loc, choose2, shiftSixteen);
+  Value term3 =
+      arith::ShLIOp::create(rewriter, loc, choose3, shiftTwentyFour);
+  Value result = arith::AddIOp::create(rewriter, loc, one, term1);
+  result = arith::AddIOp::create(rewriter, loc, result, term2);
+  result = arith::AddIOp::create(rewriter, loc, result, term3);
+  return unembedToFloat(rewriter, loc, result, floatTy);
 }
 
 Value fpsanExp2(PatternRewriter &rewriter, Location loc, Value input) {
@@ -864,6 +908,16 @@ bool externHasNumericOperands(tt::ExternElementwiseOp op) {
   return llvm::all_of(op.getOperands(), [](Value operand) {
     return isNumericLike(operand.getType());
   });
+}
+
+std::string normalizeInlineAsm(StringRef asmString) {
+  std::string normalized;
+  normalized.reserve(asmString.size());
+  for (char c : asmString) {
+    if (!llvm::isSpace(c) && c != '{' && c != '}')
+      normalized.push_back(c);
+  }
+  return normalized;
 }
 
 Value castExternOperandToResultInt(PatternRewriter &rewriter, Location loc,
@@ -2990,12 +3044,71 @@ struct ExternElementwisePattern
         op.getNumOperands() == 0 || !externHasNumericOperands(op))
       return failure();
 
+    if (op.getNumOperands() == 1) {
+      StringRef symbol = op.getSymbol();
+      if (symbol == "__nv_expf" && isF32Like(op.getType()) &&
+          isF32Like(op.getOperand(0).getType()))
+        return replaceOp(op, fpsanExp(rewriter, op.getLoc(), op.getOperand(0)),
+                         rewriter);
+      if (symbol == "__nv_exp2f" && isF32Like(op.getType()) &&
+          isF32Like(op.getOperand(0).getType()))
+        return replaceOp(
+            op, fpsanExp2(rewriter, op.getLoc(), op.getOperand(0)), rewriter);
+    }
+
     uint64_t hash = stableStringHash(op.getSymbol());
     Value result = fpsanVariadicExternTagged(rewriter, op.getLoc(), op, hash);
     if (!result)
       return emitFpSanCodegenError(op.getOperation());
     rewriter.replaceOp(op, result);
     return success();
+  }
+
+private:
+  static LogicalResult replaceOp(tt::ExternElementwiseOp op, Value result,
+                                 PatternRewriter &rewriter) {
+    if (!result)
+      return emitFpSanCodegenError(op.getOperation());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+struct ElementwiseInlineAsmPattern
+    : public OpRewritePattern<tt::ElementwiseInlineAsmOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tt::ElementwiseInlineAsmOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getPackedElement() != 1 || op.getNumResults() != 1 ||
+        !isF32Like(op->getResult(0).getType()))
+      return failure();
+
+    std::string asmString = normalizeInlineAsm(op.getAsmString());
+    if (asmString == "mul.rn.f32$0,$1,$2;" && op.getNumOperands() == 2 &&
+        llvm::all_of(op.getOperands(), [](Value operand) {
+          return isF32Like(operand.getType());
+        })) {
+      auto loc = op.getLoc();
+      auto lhs = embedToInt(rewriter, loc, op.getOperand(0));
+      auto rhs = embedToInt(rewriter, loc, op.getOperand(1));
+      auto result = arith::MulIOp::create(rewriter, loc, lhs, rhs);
+      rewriter.replaceOp(
+          op, unembedToFloat(rewriter, loc, result,
+                             op->getResult(0).getType()));
+      return success();
+    }
+
+    if (asmString == "ex2.approx.ftz.f32$0,$1;" &&
+        op.getNumOperands() == 1 &&
+        isF32Like(op.getOperand(0).getType())) {
+      Value result = fpsanExp2(rewriter, op.getLoc(), op.getOperand(0));
+      if (!result)
+        return emitFpSanCodegenError(op.getOperation());
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+    return failure();
   }
 };
 
@@ -3041,7 +3154,8 @@ public:
     patterns.add<UnaryPattern<math::CeilOp>>(&getContext(), UnaryOpId::Ceil);
     patterns.add<UnaryPattern<tt::PreciseSqrtOp>>(&getContext(),
                                                   UnaryOpId::PreciseSqrt);
-    patterns.add<ExternElementwisePattern>(&getContext());
+    patterns.add<ExternElementwisePattern, ElementwiseInlineAsmPattern>(
+        &getContext());
     patterns.add<TMEMLoadPattern, TMEMStorePattern, TMEMCopyPattern,
                  TCGen5MMAPattern, TCGen5MMAScaledPattern>(&getContext(),
                                                            &scratch);

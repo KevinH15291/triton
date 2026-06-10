@@ -12,6 +12,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
+#include <optional>
 #include <string>
 
 namespace mlir::triton::NVIDIA {
@@ -39,8 +40,9 @@ inline std::string getPtxRegisterSizeCode(int size, bool isFloat) {
 inline FailureOr<Value>
 emitPtxAtomicRMW(ConversionPatternRewriter &rewriter, Location loc,
                  Type valueElemTy, Value ptr, ArrayRef<Value> vals,
-                 RMWOp rmwOpAttr, MemSemantic sem, MemSyncScope scope,
-                 Value pred, unsigned vec = 1, unsigned packed = 1,
+                 RMWOp rmwOpAttr, MemSemantic sem,
+                 std::optional<MemSyncScope> globalScope, Value pred,
+                 unsigned vec = 1, unsigned packed = 1,
                  PtxAtomicAddrSpace addrSpace = PtxAtomicAddrSpace::Global,
                  PtxAtomicInstr instr = PtxAtomicInstr::Atom) {
   assert((vec == 1 || packed == 1) && "packed or vec must be 1");
@@ -92,14 +94,16 @@ emitPtxAtomicRMW(ConversionPatternRewriter &rewriter, Location loc,
 
   auto &atomicInstr = *ptxBuilderAtomicRMW.create(isRed ? std::string("red")
                                                         : std::string("atom"));
-  if (isGlobal)
-    atomicInstr.global();
-  else if (isSharedCluster)
-    atomicInstr.o("shared::cluster");
-  else
-    atomicInstr.shared();
-  atomicInstr.o(isSharedCluster ? "cluster"
-                                : stringifyMemSyncScope(scope).str());
+  if (isGlobal) {
+    assert(globalScope && "global atomic RMW requires a memory scope");
+    atomicInstr.global().o(stringifyMemSyncScope(*globalScope).str());
+  } else {
+    assert(!globalScope && "shared atomic RMW derives scope from address space");
+    if (isSharedCluster)
+      atomicInstr.o("shared::cluster").o("cluster");
+    else
+      atomicInstr.shared().o("cta");
+  }
 
   std::string rmwOp = stringifyRMWOp(rmwOpAttr).str();
   std::string suffix;

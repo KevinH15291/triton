@@ -70,15 +70,15 @@ FailureOr<Value> emitSharedAtomicRMW(ConversionPatternRewriter &rewriter,
                              : PtxAtomicAddrSpace::Shared;
   if (!returnOld) {
     auto result = emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
-                                   MemSemantic::RELAXED, MemSyncScope::CTA,
-                                   pred, /*vec=*/1, /*packed=*/1, addrSpace,
+                                   MemSemantic::RELAXED, std::nullopt, pred,
+                                   /*vec=*/1, /*packed=*/1, addrSpace,
                                    PtxAtomicInstr::Red);
     if (succeeded(result))
       return result;
   }
 
   return emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
-                          MemSemantic::RELAXED, MemSyncScope::CTA, pred,
+                          MemSemantic::RELAXED, std::nullopt, pred,
                           /*vec=*/1, /*packed=*/1, addrSpace,
                           PtxAtomicInstr::Atom);
 }

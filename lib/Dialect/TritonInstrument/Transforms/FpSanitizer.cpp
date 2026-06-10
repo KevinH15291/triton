@@ -12,7 +12,6 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringExtras.h"
 #include <cassert>
 
 namespace mlir {
@@ -31,11 +30,6 @@ namespace {
 Type getIntTypeLike(Type ty);
 bool isFloatLike(Type ty) { return isa<FloatType>(getElementTypeOrSelf(ty)); }
 bool isIntLike(Type ty) { return isa<IntegerType>(getElementTypeOrSelf(ty)); }
-bool isF32Like(Type ty) {
-  auto floatTy = dyn_cast<FloatType>(getElementTypeOrSelf(ty));
-  return floatTy && floatTy.getWidth() == 32;
-}
-
 bool isNumericLike(Type ty) {
   Type elemTy = getElementTypeOrSelf(ty);
   return isa<FloatType>(elemTy) || isa<IntegerType>(elemTy);
@@ -879,16 +873,6 @@ bool externHasNumericOperands(tt::ExternElementwiseOp op) {
   return llvm::all_of(op.getOperands(), [](Value operand) {
     return isNumericLike(operand.getType());
   });
-}
-
-std::string normalizeInlineAsm(StringRef asmString) {
-  std::string normalized;
-  normalized.reserve(asmString.size());
-  for (char c : asmString) {
-    if (!llvm::isSpace(c) && c != '{' && c != '}')
-      normalized.push_back(c);
-  }
-  return normalized;
 }
 
 Value castExternOperandToResultInt(PatternRewriter &rewriter, Location loc,
@@ -3024,26 +3008,6 @@ struct ExternElementwisePattern
   }
 };
 
-struct ElementwiseInlineAsmPattern
-    : public OpRewritePattern<tt::ElementwiseInlineAsmOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(tt::ElementwiseInlineAsmOp op,
-                                PatternRewriter &rewriter) const override {
-    if (op.getPackedElement() != 1 || op.getNumResults() != 1 ||
-        !isF32Like(op->getResult(0).getType()) || op.getNumOperands() != 1 ||
-        !isF32Like(op.getOperand(0).getType()) ||
-        normalizeInlineAsm(op.getAsmString()) != "ex2.approx.ftz.f32$0,$1;")
-      return failure();
-
-    Value result = fpsanExp2(rewriter, op.getLoc(), op.getOperand(0));
-    if (!result)
-      return emitFpSanCodegenError(op.getOperation());
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-};
-
 class FpSanitizerPass
     : public impl::TritonInstrumentFpSanitizerBase<FpSanitizerPass> {
 public:
@@ -3086,8 +3050,7 @@ public:
     patterns.add<UnaryPattern<math::CeilOp>>(&getContext(), UnaryOpId::Ceil);
     patterns.add<UnaryPattern<tt::PreciseSqrtOp>>(&getContext(),
                                                   UnaryOpId::PreciseSqrt);
-    patterns.add<ExternElementwisePattern, ElementwiseInlineAsmPattern>(
-        &getContext());
+    patterns.add<ExternElementwisePattern>(&getContext());
     patterns.add<TMEMLoadPattern, TMEMStorePattern, TMEMCopyPattern,
                  TCGen5MMAPattern, TCGen5MMAScaledPattern>(&getContext(),
                                                            &scratch);

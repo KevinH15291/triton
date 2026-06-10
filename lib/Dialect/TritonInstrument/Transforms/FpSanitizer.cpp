@@ -755,11 +755,12 @@ Value fpsanExp2FromInt(PatternRewriter &rewriter, Location loc, Value xI,
     y = arith::MulIOp::create(rewriter, loc, y, y);
     Value bitIndex =
         arith::SubIOp::create(rewriter, loc, rewriter.getI32Type(), topBit, i);
-    Value shift = castScalarIntToIntLike(rewriter, loc, bitIndex, xI.getType());
+    Value shift =
+        castScalarIntToIntLike(rewriter, loc, bitIndex, xI.getType());
     Value bit = arith::ShLIOp::create(rewriter, loc, one, shift);
     auto masked = arith::AndIOp::create(rewriter, loc, xI, bit);
-    auto isZero = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                                        masked, zero);
+    auto isZero = arith::CmpIOp::create(
+        rewriter, loc, arith::CmpIPredicate::eq, masked, zero);
     auto factor = arith::SelectOp::create(rewriter, loc, isZero, one, c);
     y = arith::MulIOp::create(rewriter, loc, y, factor);
     scf::YieldOp::create(rewriter, loc, y);
@@ -3052,8 +3053,8 @@ struct ExternElementwisePattern
                          rewriter);
       if (symbol == "__nv_exp2f" && isF32Like(op.getType()) &&
           isF32Like(op.getOperand(0).getType()))
-        return replaceOp(op, fpsanExp2(rewriter, op.getLoc(), op.getOperand(0)),
-                         rewriter);
+        return replaceOp(
+            op, fpsanExp2(rewriter, op.getLoc(), op.getOperand(0)), rewriter);
     }
 
     uint64_t hash = stableStringHash(op.getSymbol());
@@ -3093,12 +3094,14 @@ struct ElementwiseInlineAsmPattern
       auto lhs = embedToInt(rewriter, loc, op.getOperand(0));
       auto rhs = embedToInt(rewriter, loc, op.getOperand(1));
       auto result = arith::MulIOp::create(rewriter, loc, lhs, rhs);
-      rewriter.replaceOp(op, unembedToFloat(rewriter, loc, result,
-                                            op->getResult(0).getType()));
+      rewriter.replaceOp(
+          op, unembedToFloat(rewriter, loc, result,
+                             op->getResult(0).getType()));
       return success();
     }
 
-    if (asmString == "ex2.approx.ftz.f32$0,$1;" && op.getNumOperands() == 1 &&
+    if (asmString == "ex2.approx.ftz.f32$0,$1;" &&
+        op.getNumOperands() == 1 &&
         isF32Like(op.getOperand(0).getType())) {
       Value result = fpsanExp2(rewriter, op.getLoc(), op.getOperand(0));
       if (!result)

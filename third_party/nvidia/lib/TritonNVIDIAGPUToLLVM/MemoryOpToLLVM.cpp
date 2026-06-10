@@ -31,7 +31,8 @@ bool isConstI32OneTensor(Value value) {
 }
 
 Value emitSharedInc(ConversionPatternRewriter &rewriter, Location loc,
-                    Value ptr, bool returnOld, Value pred = Value()) {
+                    Value ptr, bool returnOld, bool isCluster,
+                    Value pred = Value()) {
   PTXBuilder ptxBuilder;
   // PTX atom/red.inc resets to 0 only when the old value reaches the bound, so
   // using UINT32_MAX makes it equivalent to a wrapping increment-by-1.
@@ -39,7 +40,11 @@ Value emitSharedInc(ConversionPatternRewriter &rewriter, Location loc,
   if (!returnOld) {
     auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
     auto &red = *ptxBuilder.create("red");
-    red.shared().o("cta").o("relaxed").o("inc").o("u32");
+    if (isCluster)
+      red.o("shared::cluster").o("cluster");
+    else
+      red.shared().o("cta");
+    red.o("relaxed").o("inc").o("u32");
     red(ptrOpr, boundOpr).maybePredicate(pred, "b");
     return ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
   }
@@ -47,7 +52,11 @@ Value emitSharedInc(ConversionPatternRewriter &rewriter, Location loc,
   auto *dstOpr = ptxBuilder.newOperand("=r", /*init=*/true);
   auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
   auto &atom = *ptxBuilder.create("atom");
-  atom.shared().o("cta").o("relaxed").o("inc").o("u32");
+  if (isCluster)
+    atom.o("shared::cluster").o("cluster");
+  else
+    atom.shared().o("cta");
+  atom.o("relaxed").o("inc").o("u32");
   atom(dstOpr, ptrOpr, boundOpr).maybePredicate(pred, "b");
   return ptxBuilder.launch(rewriter, loc, i32_ty);
 }
@@ -55,20 +64,22 @@ Value emitSharedInc(ConversionPatternRewriter &rewriter, Location loc,
 FailureOr<Value> emitSharedAtomicRMW(ConversionPatternRewriter &rewriter,
                                      Location loc, Type valueElemTy, Value ptr,
                                      Value value, RMWOp rmwOp, bool returnOld,
-                                     Value pred) {
+                                     bool isCluster, Value pred) {
   SmallVector<Value> vals{value};
+  auto addrSpace = isCluster ? PtxAtomicAddrSpace::SharedCluster
+                             : PtxAtomicAddrSpace::Shared;
   if (!returnOld) {
-    auto result = emitPtxAtomicRMW(
-        rewriter, loc, valueElemTy, ptr, vals, rmwOp, MemSemantic::RELAXED,
-        MemSyncScope::CTA, pred, /*vec=*/1, /*packed=*/1,
-        PtxAtomicAddrSpace::Shared, PtxAtomicInstr::Red);
+    auto result = emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
+                                   MemSemantic::RELAXED, MemSyncScope::CTA,
+                                   pred, /*vec=*/1, /*packed=*/1, addrSpace,
+                                   PtxAtomicInstr::Red);
     if (succeeded(result))
       return result;
   }
 
   return emitPtxAtomicRMW(rewriter, loc, valueElemTy, ptr, vals, rmwOp,
                           MemSemantic::RELAXED, MemSyncScope::CTA, pred,
-                          /*vec=*/1, /*packed=*/1, PtxAtomicAddrSpace::Shared,
+                          /*vec=*/1, /*packed=*/1, addrSpace,
                           PtxAtomicInstr::Atom);
 }
 
@@ -100,6 +111,10 @@ LogicalResult lowerLdStMatrix(
     }
   }
   if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding())) {
+    return failure();
+  }
+  if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(memDescType).second !=
+      0) {
     return failure();
   }
   auto memLayout = toLinearLayout(memDescType);
@@ -395,8 +410,9 @@ static void lowerAsyncSharedStore(Location loc, MLIRContext *ctx,
   };
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   lowerLdSt(loc, ctx, cvt, vals, llvmElemTy, smemBases, paddingShifts,
-            affineOffset, maskSpanAffineOffset, laneId, warpId, rewriter,
-            targetInfo, maybeMaxVecElems, emitSt);
+            affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+            /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+            maybeMaxVecElems, emitSt);
 }
 
 struct AsyncSharedStoreOpConversion
@@ -474,21 +490,25 @@ public:
 
     SmallVector<Value> results;
     if (returnOld)
-      results.reserve(info.ptrs.size());
-    for (auto [i, ptrAndValue] :
-         llvm::enumerate(llvm::zip(info.ptrs, info.values))) {
-      auto [ptr, value] = ptrAndValue;
+      results.reserve(info.addrs.size());
+    for (auto [i, addrAndValue] :
+         llvm::enumerate(llvm::zip(info.addrs, info.values))) {
+      auto [addr, value] = addrAndValue;
       Value pred =
           maybeAnd(rewriter, loc, info.threadPred,
                    info.maskValues.empty() ? Value() : info.maskValues[i]);
+      bool isCluster = bool(addr.ctaId);
+      Value ptr =
+          targetInfo.mapDShared(rewriter, loc, addr.ptr, addr.ctaId, pred);
       if (isI32Inc) {
-        Value result = emitSharedInc(rewriter, loc, ptr, returnOld, pred);
+        Value result =
+            emitSharedInc(rewriter, loc, ptr, returnOld, isCluster, pred);
         if (returnOld)
           results.push_back(result);
         continue;
       }
       auto old = emitSharedAtomicRMW(rewriter, loc, info.llvmElemTy, ptr, value,
-                                     rmwOp, returnOld, pred);
+                                     rmwOp, returnOld, isCluster, pred);
       if (failed(old))
         return failure();
       if (returnOld)

@@ -670,14 +670,13 @@ FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
       emitIndices(loc, rewriter, targetInfo, activeRegLayout, valuesTy,
                   /*withCTAOffset=*/true);
 
-  SmallVector<Value> ptrs = llvm::map_to_vector(
+  SmallVector<LocalSharedMemoryAddress> addrs =
       computeLocalAddrs(loc, memDescTy, smemObj, llvmElemTy, idxValues,
-                        srcIndices, op.getAxis(), rewriter),
-      [](const LocalSharedMemoryAddress &addr) { return addr.ptr; });
+                        srcIndices, op.getAxis(), rewriter);
 
   return LocalAtomicScatterRMWInfo{valuesTy,        llvmElemTy, regLayout,
                                    removeBroadcast, threadPred, values,
-                                   maskValues,      ptrs};
+                                   maskValues,      addrs};
 }
 
 SmallVector<std::pair<unsigned, unsigned>>
@@ -730,6 +729,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Type llvmElemTy, ArrayRef<Value> smemBases,
                 ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
+                Value affineBlockOffset, uint64_t maskSpanAffineBlock,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp) {
 
@@ -756,8 +756,9 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
   };
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
-                   paddingShifts, affineOffset, maskSpanAffineOffset, laneId,
-                   warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt);
+                   paddingShifts, affineOffset, maskSpanAffineOffset,
+                   affineBlockOffset, maskSpanAffineBlock, laneId, warpId,
+                   rewriter, targetInfo, maybeMaxVecElems, emitLdSt);
 }
 
 SmallVector<Value> lowerLdSt(
@@ -765,7 +766,8 @@ SmallVector<Value> lowerLdSt(
     ArrayRef<Value> valsArray, // Input for store, output for load
     Type llvmElemTy, ArrayRef<Value> smemBases,
     ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
+    uint64_t maskSpanAffineOffset, Value affineBlockOffset,
+    uint64_t maskSpanAffineBlock, Value laneId, Value warpId,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     std::optional<int> maybeMaxVecElems,
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
@@ -844,9 +846,10 @@ SmallVector<Value> lowerLdSt(
       LinearLayout::zeros1D(bitwidth / 8, kReg, kOffset, bitwidth / 8);
   auto i8AddrLayout = i8Tile * addrLayout;
 
+  bool layoutUsesBlockId = !reps.isTrivialOver({kBlock});
+  bool useBlockId = layoutUsesBlockId || maskSpanAffineBlock != 0;
   Value blockId = b.i32_val(0);
-  bool useBlockId = !reps.isTrivialOver({kBlock});
-  if (useBlockId) {
+  if (layoutUsesBlockId) {
     blockId = targetInfo.getClusterCTAId(rewriter, loc);
   }
 
@@ -859,6 +862,8 @@ SmallVector<Value> lowerLdSt(
   Value targetCtaId;
   if (useBlockId) {
     targetCtaId = baseI8AndCTA[1].second;
+    if (maskSpanAffineBlock != 0)
+      targetCtaId = b.xor_(targetCtaId, affineBlockOffset);
   }
 
   // It's fine that we don't compute the offset in bytes as affineOffset
@@ -961,8 +966,10 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
     }
     return outVals;
   }
-  auto affineOffset = smemObj.getShmemOffset(loc, rewriter, srcTy);
-  auto maskSpanAffineOffset = smemObj.getMaskSpanOffsets(srcTy);
+  auto [affineOffset, affineBlockOffset] =
+      smemObj.getShmemOffsetAndBlock(loc, rewriter, srcTy);
+  auto [maskSpanAffineOffset, maskSpanAffineBlock] =
+      smemObj.getMaskSpanOffsetsAndBlocks(srcTy);
 
   // Extract padding info from padded encoding (standalone or inside
   // partitioned)
@@ -982,7 +989,8 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                                smemObj.getBases().end());
   return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
                          paddingShifts, affineOffset, maskSpanAffineOffset,
-                         rewriter, targetInfo, maybeMaxVecElems, localLoadOp);
+                         affineBlockOffset, maskSpanAffineBlock, rewriter,
+                         targetInfo, maybeMaxVecElems, localLoadOp);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
@@ -2077,7 +2085,8 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
   SmallVector<Value> smemBases = {smemBase};
   lowerLdSt(loc, ctx, storeCvt, uniqueResultVals, valueElemTy, smemBases,
             /*paddingShifts=*/{}, /*affineOffset=*/b.i32_val(0),
-            /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter, targetInfo,
+            /*maskSpanAffineOffset=*/0, /*affineBlockOffset=*/Value(),
+            /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
             /*maybeMaxVecElems=*/{}, emitSt);
   if (crossCTA)
     targetInfo.clusterBarrier(loc, rewriter, op);
@@ -2087,8 +2096,9 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
   resultVals =
       lowerLdSt(loc, ctx, loadCvt, /*valsArray=*/{}, valueElemTy, smemBases,
                 /*paddingShifts=*/{}, /*affineOffset=*/b.i32_val(0),
-                /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter,
-                targetInfo, /*maybeMaxVecElems=*/{}, emitLd);
+                /*maskSpanAffineOffset=*/0, /*affineBlockOffset=*/Value(),
+                /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+                /*maybeMaxVecElems=*/{}, emitLd);
   if (!removeRegBroadcast.isIdentity())
     resultVals = broadcastAs(resultVals, regLayout);
 

@@ -1180,10 +1180,11 @@ LogicalResult MemDescSubsliceOp::verify() {
   if (splitsAcrossCTAs &&
       (getResult().use_empty() ||
        !llvm::all_of(getResult().getUsers(), [](Operation *user) {
-         return isa<LocalGatherOp>(user);
+         return isa<LocalLoadOp, LocalStoreOp, LocalGatherOp, LocalScatterOp,
+                    LocalAtomicScatterRMWOp>(user);
        }))) {
     return emitError("Splitting along CTA dimensions is only supported for "
-                     "local gather");
+                     "local load, store, gather, scatter, and atomic scatter");
   }
   return success();
 }

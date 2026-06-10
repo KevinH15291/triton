@@ -16,7 +16,7 @@
 
 namespace mlir::triton::NVIDIA {
 
-enum class PtxAtomicAddrSpace { Global, Shared };
+enum class PtxAtomicAddrSpace { Global, Shared, SharedCluster };
 enum class PtxAtomicInstr { Atom, Red };
 
 inline std::string getPtxRegisterSizeCode(int size, bool isFloat) {
@@ -49,6 +49,7 @@ emitPtxAtomicRMW(ConversionPatternRewriter &rewriter, Location loc,
 
   bool isRed = instr == PtxAtomicInstr::Red;
   bool isGlobal = addrSpace == PtxAtomicAddrSpace::Global;
+  bool isSharedCluster = addrSpace == PtxAtomicAddrSpace::SharedCluster;
   assert((isGlobal || (vec == 1 && packed == 1)) &&
          "shared atomic RMW does not support vectorized lowering");
 
@@ -93,9 +94,12 @@ emitPtxAtomicRMW(ConversionPatternRewriter &rewriter, Location loc,
                                                         : std::string("atom"));
   if (isGlobal)
     atomicInstr.global();
+  else if (isSharedCluster)
+    atomicInstr.o("shared::cluster");
   else
     atomicInstr.shared();
-  atomicInstr.o(stringifyMemSyncScope(scope).str());
+  atomicInstr.o(isSharedCluster ? "cluster"
+                                : stringifyMemSyncScope(scope).str());
 
   std::string rmwOp = stringifyRMWOp(rmwOpAttr).str();
   std::string suffix;

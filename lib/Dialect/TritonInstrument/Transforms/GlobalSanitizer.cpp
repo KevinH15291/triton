@@ -293,8 +293,7 @@ static void instrumentAsyncTMALoad(ttng::AsyncTMACopyGlobalToLocalOp op) {
 
   OpBuilder builder(op);
   auto desc = getDescriptorInfo(op.getDesc(), builder);
-  auto blockShape =
-      cast<tt::TensorDescType>(op.getDesc().getType()).getShape();
+  auto blockShape = cast<tt::TensorDescType>(op.getDesc().getType()).getShape();
 
   auto offsets = castToI64(builder, op.getLoc(), op.getCoord());
   auto access = createTiledAccess(builder, op.getLoc(), desc, blockShape,
@@ -319,8 +318,7 @@ static void instrumentAsyncTMAStore(Operation *op, Value descValue,
 static void instrumentAsyncTMAReduce(ttng::AsyncTMAReduceOp op) {
   OpBuilder builder(op);
   auto desc = getDescriptorInfo(op.getDesc(), builder);
-  auto blockShape =
-      cast<tt::TensorDescType>(op.getDesc().getType()).getShape();
+  auto blockShape = cast<tt::TensorDescType>(op.getDesc().getType()).getShape();
 
   auto offsets = castToI64(builder, op.getLoc(), op.getCoord());
   auto access = createTiledAccess(builder, op.getLoc(), desc, blockShape,

@@ -37,27 +37,22 @@ Value emitSharedInc(ConversionPatternRewriter &rewriter, Location loc,
   // PTX atom/red.inc resets to 0 only when the old value reaches the bound, so
   // using UINT32_MAX makes it equivalent to a wrapping increment-by-1.
   auto *boundOpr = ptxBuilder.newConstantOperand("0xffffffff");
+  auto &inc = *ptxBuilder.create(returnOld ? "atom" : "red");
+  if (isCluster)
+    inc.o("shared::cluster").o("cluster");
+  else
+    inc.shared().o("cta");
+  inc.o("relaxed").o("inc").o("u32");
+
   if (!returnOld) {
     auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
-    auto &red = *ptxBuilder.create("red");
-    if (isCluster)
-      red.o("shared::cluster").o("cluster");
-    else
-      red.shared().o("cta");
-    red.o("relaxed").o("inc").o("u32");
-    red(ptrOpr, boundOpr).maybePredicate(pred, "b");
+    inc(ptrOpr, boundOpr).maybePredicate(pred, "b");
     return ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
   }
 
   auto *dstOpr = ptxBuilder.newOperand("=r", /*init=*/true);
   auto *ptrOpr = ptxBuilder.newAddrOperand(ptr, "r");
-  auto &atom = *ptxBuilder.create("atom");
-  if (isCluster)
-    atom.o("shared::cluster").o("cluster");
-  else
-    atom.shared().o("cta");
-  atom.o("relaxed").o("inc").o("u32");
-  atom(dstOpr, ptrOpr, boundOpr).maybePredicate(pred, "b");
+  inc(dstOpr, ptrOpr, boundOpr).maybePredicate(pred, "b");
   return ptxBuilder.launch(rewriter, loc, i32_ty);
 }
 

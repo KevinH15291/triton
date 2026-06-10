@@ -1330,20 +1330,15 @@ std::pair<uint64_t, uint64_t> SharedMemoryObject::getMaskSpanOffsetsAndBlocks(
     logicalOffsets.push_back({dim, 0});
   }
 
-  auto kOffset = str_attr("offset");
-  auto kBlock = str_attr("block");
   uint64_t offsetMask = 0;
   uint64_t blockMask = 0;
   for (auto [dim, shapes] : llvm::enumerate(llvm::zip(shape, allocShape))) {
     auto [shape, allocShape] = shapes;
     for (int j = llvm::Log2_32(shape); j < llvm::Log2_32(allocShape); ++j) {
       logicalOffsets[dim].second = 1 << j;
-      for (auto [name, value] : invLl.apply(logicalOffsets)) {
-        if (name == kOffset)
-          offsetMask |= value;
-        else if (name == kBlock)
-          blockMask |= value;
-      }
+      auto offsetAndBlock = invLl.apply(logicalOffsets);
+      offsetMask |= offsetAndBlock[0].second;
+      blockMask |= offsetAndBlock[1].second;
     }
     // Reset the offset for the next dimension
     logicalOffsets[dim].second = 0;
@@ -1383,18 +1378,9 @@ std::pair<Value, Value> SharedMemoryObject::getShmemOffsetAndBlock(
     logicalOffsets.push_back({dim, offset});
   }
 
-  Value offset = b.i32_val(0);
-  Value block = b.i32_val(0);
-  auto kOffset = str_attr("offset");
-  auto kBlock = str_attr("block");
-  for (auto [name, value] :
-       applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets)) {
-    if (name == kOffset)
-      offset = value;
-    else if (name == kBlock)
-      block = value;
-  }
-  return {offset, block};
+  auto offsetAndBlock =
+      applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets);
+  return {offsetAndBlock[0].second, offsetAndBlock[1].second};
 }
 
 Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,

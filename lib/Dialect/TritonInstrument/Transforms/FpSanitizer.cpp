@@ -13,6 +13,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include <cassert>
 
 namespace mlir {
@@ -678,6 +679,16 @@ Value fpsanFDiv(PatternRewriter &rewriter, Location loc, Value num, Value den) {
   auto inv = fpsanIntInv(rewriter, loc, denI);
   auto resI = arith::MulIOp::create(rewriter, loc, numI, inv);
   return unembedToFloat(rewriter, loc, resI, num.getType());
+}
+
+Value fpsanFma(PatternRewriter &rewriter, Location loc, Value a, Value b,
+               Value c) {
+  auto aI = embedToInt(rewriter, loc, a);
+  auto bI = embedToInt(rewriter, loc, b);
+  auto cI = embedToInt(rewriter, loc, c);
+  auto mul = arith::MulIOp::create(rewriter, loc, aI, bI);
+  auto sum = arith::AddIOp::create(rewriter, loc, mul, cI);
+  return unembedToFloat(rewriter, loc, sum, a.getType());
 }
 
 Value fpsanSRem(PatternRewriter &rewriter, Location loc, Value num, Value den) {
@@ -1780,14 +1791,8 @@ struct FmaPattern : public OpRewritePattern<math::FmaOp> {
                                 PatternRewriter &rewriter) const override {
     if (!isFloatLike(op.getType()))
       return failure();
-    auto loc = op.getLoc();
-    auto aI = embedToInt(rewriter, loc, op.getA());
-    auto bI = embedToInt(rewriter, loc, op.getB());
-    auto cI = embedToInt(rewriter, loc, op.getC());
-    auto mul = arith::MulIOp::create(rewriter, loc, aI, bI);
-    auto sum = arith::AddIOp::create(rewriter, loc, mul, cI);
-    auto resF = unembedToFloat(rewriter, loc, sum, op.getType());
-    rewriter.replaceOp(op, resF);
+    rewriter.replaceOp(
+        op, fpsanFma(rewriter, op.getLoc(), op.getA(), op.getB(), op.getC()));
     return success();
   }
 };
@@ -2774,6 +2779,67 @@ private:
   UnaryOpId unaryOpId;
 };
 
+bool hasFp32Signature(tt::ExternElementwiseOp op, unsigned arity) {
+  if (op.getNumOperands() != arity ||
+      !getElementTypeOrSelf(op.getType()).isF32())
+    return false;
+  return llvm::all_of(op.getOperandTypes(), [](Type type) {
+    return getElementTypeOrSelf(type).isF32();
+  });
+}
+
+using KnownExternTransform = Value (*)(PatternRewriter &,
+                                       tt::ExternElementwiseOp);
+
+template <Value (*Transform)(PatternRewriter &, Location, Value)>
+Value fpsanUnaryExtern(PatternRewriter &rewriter, tt::ExternElementwiseOp op) {
+  if (!hasFp32Signature(op, 1))
+    return Value();
+  return Transform(rewriter, op.getLoc(), op.getOperand(0));
+}
+
+template <UnaryOpId OpId>
+Value fpsanTaggedUnaryExtern(PatternRewriter &rewriter,
+                             tt::ExternElementwiseOp op) {
+  if (!hasFp32Signature(op, 1))
+    return Value();
+  return fpsanUnaryTagged(rewriter, op.getLoc(), op.getOperand(0), OpId);
+}
+
+template <Value (*Transform)(PatternRewriter &, Location, Value, Value)>
+Value fpsanBinaryExtern(PatternRewriter &rewriter, tt::ExternElementwiseOp op) {
+  if (!hasFp32Signature(op, 2))
+    return Value();
+  return Transform(rewriter, op.getLoc(), op.getOperand(0), op.getOperand(1));
+}
+
+template <Value (*Transform)(PatternRewriter &, Location, Value, Value, Value)>
+Value fpsanTernaryExtern(PatternRewriter &rewriter,
+                         tt::ExternElementwiseOp op) {
+  if (!hasFp32Signature(op, 3))
+    return Value();
+  return Transform(rewriter, op.getLoc(), op.getOperand(0), op.getOperand(1),
+                   op.getOperand(2));
+}
+
+std::optional<KnownExternTransform> getKnownExtern(StringRef symbol) {
+  return llvm::StringSwitch<std::optional<KnownExternTransform>>(symbol)
+      .Case("__nv_fast_expf", &fpsanUnaryExtern<fpsanExp>)
+      .Case("__nv_exp2f", &fpsanUnaryExtern<fpsanExp2>)
+      .Case("__nv_logf", &fpsanTaggedUnaryExtern<UnaryOpId::Log>)
+      .Case("__nv_log2f", &fpsanTaggedUnaryExtern<UnaryOpId::Log2>)
+      .Case("__nv_cosf", &fpsanUnaryExtern<fpsanCos>)
+      .Case("__nv_sinf", &fpsanUnaryExtern<fpsanSin>)
+      .Case("__nv_rsqrtf", &fpsanTaggedUnaryExtern<UnaryOpId::Rsqrt>)
+      .Case("__nv_erff", &fpsanTaggedUnaryExtern<UnaryOpId::Erf>)
+      .Case("__nv_floorf", &fpsanTaggedUnaryExtern<UnaryOpId::Floor>)
+      .Case("__nv_ceilf", &fpsanTaggedUnaryExtern<UnaryOpId::Ceil>)
+      .Case("__nv_fsqrt_rn", &fpsanTaggedUnaryExtern<UnaryOpId::PreciseSqrt>)
+      .Case("__nv_fdiv_rn", &fpsanBinaryExtern<fpsanFDiv>)
+      .Case("__nv_fmaf", &fpsanTernaryExtern<fpsanFma>)
+      .Default(std::nullopt);
+}
+
 struct ExternElementwisePattern
     : public OpRewritePattern<tt::ExternElementwiseOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -2784,8 +2850,15 @@ struct ExternElementwisePattern
         op.getNumOperands() == 0 || !externHasNumericOperands(op))
       return failure();
 
-    uint64_t hash = stableStringHash(op.getSymbol());
-    Value result = fpsanVariadicExternTagged(rewriter, op.getLoc(), op, hash);
+    Value result;
+    // FPSan models the intended operation, so aliases may intentionally ignore
+    // backend details such as flushing subnormal inputs or outputs to zero.
+    if (auto transform = getKnownExtern(op.getSymbol()))
+      result = (*transform)(rewriter, op);
+    if (!result) {
+      uint64_t hash = stableStringHash(op.getSymbol());
+      result = fpsanVariadicExternTagged(rewriter, op.getLoc(), op, hash);
+    }
     if (!result)
       return emitFpSanCodegenError(op.getOperation());
     rewriter.replaceOp(op, result);
